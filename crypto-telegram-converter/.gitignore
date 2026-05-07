@@ -1,0 +1,4 @@
+.env
+.telegram_offset
+__pycache__/
+*.py[cod]
