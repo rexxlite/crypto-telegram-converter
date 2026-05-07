@@ -22,6 +22,12 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 TELEGRAM_BOT_TOKEN=token_dari_botfather
 ```
 
+Jika VPS kamu mendapat error Binance `451 restricted location`, coba tambahkan endpoint market-data Binance di `.env`:
+
+```env
+BINANCE_API_BASES=https://data-api.binance.vision,https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com
+```
+
 4. Jalankan bot:
 
 ```bash
@@ -34,6 +40,7 @@ python3 bot.py
 
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
+- Bot mencoba beberapa endpoint Binance secara berurutan, termasuk `data-api.binance.vision` untuk market data.
 - Harga USD memakai pair USDT Binance, misalnya BTCUSDT.
 - Timeframe Binance yang didukung: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`.
 - `1M` artinya 1 bulan dan harus huruf M besar. Bot juga menerima alias `1mo`.

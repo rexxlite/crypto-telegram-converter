@@ -25,6 +25,14 @@ from typing import Any
 
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 BINANCE_API_BASE = "https://api.binance.com"
+BINANCE_API_BASES = (
+    "https://api.binance.com",
+    "https://data-api.binance.vision",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_VS_CURRENCIES = ("usd", "idr")
@@ -161,8 +169,10 @@ class KlineResult:
 
 
 class BinanceMarketClient:
-    def __init__(self, api_base: str = BINANCE_API_BASE) -> None:
-        self.api_base = api_base.rstrip("/")
+    def __init__(self, api_bases: tuple[str, ...] = BINANCE_API_BASES) -> None:
+        self.api_bases = tuple(base.rstrip("/") for base in api_bases if base.strip())
+        if not self.api_bases:
+            self.api_bases = BINANCE_API_BASES
         self._price_cache: dict[str, tuple[float, Decimal]] = {}
         self._kline_cache: dict[tuple[str, str], tuple[float, KlineResult]] = {}
 
@@ -296,21 +306,39 @@ class BinanceMarketClient:
 
     def binance_get_json(self, path: str, params: dict[str, Any]) -> Any:
         query = urllib.parse.urlencode(params)
-        url = f"{self.api_base}{path}?{query}"
-        request = urllib.request.Request(
-            url,
-            headers={"User-Agent": "crypto-telegram-converter/2.0"},
-        )
+        failures: list[str] = []
 
-        try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            message = parse_error_message(body) or str(exc)
-            if "Invalid symbol" in message or "-1121" in body:
-                raise SymbolUnavailable(message) from exc
-            raise BotError(f"Binance API error ({exc.code}): {message}") from exc
+        for api_base in self.api_bases:
+            url = f"{api_base}{path}?{query}"
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "crypto-telegram-converter/2.0"},
+            )
+
+            try:
+                with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                message = parse_error_message(body) or str(exc)
+                if "Invalid symbol" in message or "-1121" in body:
+                    raise SymbolUnavailable(message) from exc
+                failures.append(f"{api_base} -> {exc.code}: {message}")
+                if exc.code in {418, 429, 451, 500, 502, 503, 504}:
+                    continue
+                raise BotError(f"Binance API error ({exc.code}): {message}") from exc
+            except urllib.error.URLError as exc:
+                failures.append(f"{api_base} -> {exc.reason}")
+                continue
+
+        if any("451:" in failure for failure in failures):
+            raise BotError(
+                "Binance menolak request dari lokasi/IP VPS ini (HTTP 451 restricted location). "
+                "Coba pindah region VPS, gunakan jaringan lain, atau set BINANCE_API_BASES ke endpoint Binance "
+                "yang bisa diakses dari server kamu."
+            )
+
+        raise BotError("Semua endpoint Binance gagal diakses: " + " | ".join(failures))
 
 
 class TelegramBot:
@@ -595,6 +623,14 @@ def parse_error_message(body: str) -> str | None:
     return body.strip() or None
 
 
+def parse_api_bases(raw_value: str | None) -> tuple[str, ...]:
+    if not raw_value:
+        return BINANCE_API_BASES
+
+    bases = tuple(base.strip() for base in raw_value.split(",") if base.strip())
+    return bases or BINANCE_API_BASES
+
+
 def load_env_file(path: str = ".env") -> None:
     if not os.path.isabs(path):
         path = os.path.join(BASE_DIR, path)
@@ -679,8 +715,8 @@ def main() -> int:
         print("TELEGRAM_BOT_TOKEN belum diisi. Buat .env dari .env.example dulu.", file=sys.stderr)
         return 1
 
-    api_base = os.environ.get("BINANCE_API_BASE", BINANCE_API_BASE)
-    bot = TelegramBot(token=token, price_client=BinanceMarketClient(api_base=api_base))
+    api_bases = parse_api_bases(os.environ.get("BINANCE_API_BASES") or os.environ.get("BINANCE_API_BASE"))
+    bot = TelegramBot(token=token, price_client=BinanceMarketClient(api_bases=api_bases))
     bot.run_forever()
     return 0
 
