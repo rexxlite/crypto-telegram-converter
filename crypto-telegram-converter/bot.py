@@ -562,7 +562,6 @@ def render_candlestick_chart(chart: ChartResult) -> bytes:
         fontsize=8,
         ha="left",
     )
-    fig.text(0.07, 0.115, "CryptoWhaleBot", color="#dbe4ee", fontsize=9, fontweight="bold", alpha=0.92)
     fig.patches.append(
         Rectangle((0.01, 0.01), 0.98, 0.98, transform=fig.transFigure, fill=False, edgecolor="#00fff0", linewidth=3)
     )
