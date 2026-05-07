@@ -8,7 +8,9 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/price eth idr` menampilkan harga ETH ke IDR.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
 - `/convert 250 doge idr` mengonversi jumlah coin ke IDR.
-- `/kline btc 15m` menampilkan candle BTCUSDT timeframe 15 menit.
+- `/tv eth` mengirim gambar chart ETHUSDT timeframe default 1h.
+- `/tv eth 15m` mengirim gambar chart ETHUSDT timeframe 15 menit.
+- `/kline btc 15m` menampilkan candle BTCUSDT timeframe 15 menit dalam bentuk teks.
 - `/timeframes` menampilkan daftar timeframe Binance yang didukung.
 - Format cepat: `btc`, `eth idr`, `btc 15m`, `eth 30m`, `0.1 btc to idr`.
 
@@ -28,19 +30,34 @@ Jika VPS kamu mendapat error Binance `451 restricted location`, coba tambahkan e
 BINANCE_API_BASES=https://data-api.binance.vision,https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com
 ```
 
-4. Jalankan bot:
+4. Install dependency chart:
+
+```bash
+pip3 install -r requirements.txt
+```
+
+Kalau `pip3` belum ada:
+
+```bash
+sudo apt update
+sudo apt install -y python3-pip
+pip3 install -r requirements.txt
+```
+
+5. Jalankan bot:
 
 ```bash
 python3 bot.py
 ```
 
-5. Buka chat bot Telegram kamu, lalu kirim `/start`.
+6. Buka chat bot Telegram kamu, lalu kirim `/start`.
 
 ## Catatan
 
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
 - Bot mencoba beberapa endpoint Binance secara berurutan, termasuk `data-api.binance.vision` untuk market data.
+- Chart dibuat lokal di VPS dengan `matplotlib`, lalu dikirim ke Telegram sebagai foto.
 - Harga USD memakai pair USDT Binance, misalnya BTCUSDT.
 - Timeframe Binance yang didukung: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`.
 - `1M` artinya 1 bulan dan harus huruf M besar. Bot juga menerima alias `1mo`.

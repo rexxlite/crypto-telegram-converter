@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.error
@@ -20,6 +21,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 from typing import Any
 
 
@@ -40,6 +42,7 @@ REQUEST_TIMEOUT_SECONDS = 20
 POLL_TIMEOUT_SECONDS = 35
 PRICE_CACHE_SECONDS = 5
 KLINE_CACHE_SECONDS = 5
+CHART_CANDLE_LIMIT = 134
 
 BINANCE_TIMEFRAMES = (
     "1s",
@@ -112,6 +115,8 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /price eth idr
 /convert 0.5 btc usd
 /convert 250 doge idr
+/tv eth
+/tv eth 15m
 /kline btc 15m
 /timeframes
 
@@ -122,6 +127,7 @@ btc 15m
 eth 30m
 0.1 btc to idr
 
+Chart dikirim sebagai gambar candlestick.
 Timeframe Binance yang tersedia:
 {", ".join(BINANCE_TIMEFRAMES)}
 
@@ -146,6 +152,19 @@ class PriceResult:
 
 
 @dataclass
+class CandleBar:
+    open_time_ms: int
+    close_time_ms: int
+    open_price: Decimal
+    high_price: Decimal
+    low_price: Decimal
+    close_price: Decimal
+    volume: Decimal
+    quote_volume: Decimal
+    trades: int
+
+
+@dataclass
 class KlineResult:
     asset: str
     symbol: str
@@ -166,6 +185,22 @@ class KlineResult:
         if self.open_price == 0:
             return Decimal("0")
         return ((self.close_price - self.open_price) / self.open_price) * Decimal("100")
+
+
+@dataclass
+class ChartResult:
+    asset: str
+    symbol: str
+    interval: str
+    bars: list[CandleBar]
+    live_price: Decimal
+
+
+@dataclass
+class PhotoReply:
+    photo: bytes
+    caption: str
+    filename: str = "chart.png"
 
 
 class BinanceMarketClient:
@@ -304,6 +339,48 @@ class BinanceMarketClient:
         self._kline_cache[(symbol, interval)] = (now, result)
         return result
 
+    def get_klines(self, coin_text: str, interval: str, limit: int = CHART_CANDLE_LIMIT) -> ChartResult:
+        interval = normalize_timeframe(interval)
+        asset, symbol = self.build_symbol(coin_text, "USDT")
+        safe_limit = max(30, min(limit, 500))
+
+        data = self.binance_get_json(
+            "/api/v3/klines",
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": str(safe_limit),
+            },
+        )
+        if not isinstance(data, list) or not data:
+            raise SymbolUnavailable(f"Chart {symbol} {interval} tidak tersedia di Binance Spot.")
+
+        bars: list[CandleBar] = []
+        for row in data:
+            if not isinstance(row, list) or len(row) < 9:
+                raise BotError("Format response chart Binance tidak dikenali.")
+            bars.append(
+                CandleBar(
+                    open_time_ms=int(row[0]),
+                    open_price=Decimal(str(row[1])),
+                    high_price=Decimal(str(row[2])),
+                    low_price=Decimal(str(row[3])),
+                    close_price=Decimal(str(row[4])),
+                    volume=Decimal(str(row[5])),
+                    close_time_ms=int(row[6]),
+                    quote_volume=Decimal(str(row[7])),
+                    trades=int(row[8]),
+                )
+            )
+
+        return ChartResult(
+            asset=asset,
+            symbol=symbol,
+            interval=interval,
+            bars=bars,
+            live_price=self.get_symbol_price(symbol),
+        )
+
     def binance_get_json(self, path: str, params: dict[str, Any]) -> Any:
         query = urllib.parse.urlencode(params)
         failures: list[str] = []
@@ -339,6 +416,159 @@ class BinanceMarketClient:
             )
 
         raise BotError("Semua endpoint Binance gagal diakses: " + " | ".join(failures))
+
+
+def render_candlestick_chart(chart: ChartResult) -> bytes:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        from matplotlib.ticker import FuncFormatter
+    except ModuleNotFoundError as exc:
+        raise BotError(
+            "Fitur chart membutuhkan matplotlib. Jalankan di VPS: pip3 install -r requirements.txt"
+        ) from exc
+
+    bars = chart.bars
+    if len(bars) < 2:
+        raise BotError("Data candle belum cukup untuk membuat chart.")
+
+    x_values = list(range(len(bars)))
+    high = max(float(bar.high_price) for bar in bars)
+    low = min(float(bar.low_price) for bar in bars)
+    price_padding = max((high - low) * 0.08, high * 0.002)
+    price_min = low - price_padding
+    price_max = high + price_padding
+    body_min_height = max((price_max - price_min) * 0.0012, 0.00000001)
+
+    fig, (ax_price, ax_volume) = plt.subplots(
+        2,
+        1,
+        figsize=(12.8, 7.2),
+        dpi=100,
+        sharex=True,
+        gridspec_kw={"height_ratios": [4.3, 1], "hspace": 0.03},
+    )
+    fig.patch.set_facecolor("#050608")
+    fig.subplots_adjust(left=0.04, right=0.925, top=0.87, bottom=0.09)
+
+    for axis in (ax_price, ax_volume):
+        axis.set_facecolor("#101214")
+        axis.grid(True, color="#252a30", linewidth=0.65, alpha=0.55)
+        axis.tick_params(colors="#9aa4af", labelsize=8)
+        axis.yaxis.tick_right()
+        for spine in axis.spines.values():
+            spine.set_color("#20252b")
+
+    candle_width = 0.58
+    green = "#00b894"
+    red = "#e64b5d"
+
+    for index, bar in enumerate(bars):
+        open_price = float(bar.open_price)
+        high_price = float(bar.high_price)
+        low_price = float(bar.low_price)
+        close_price = float(bar.close_price)
+        color = green if bar.close_price >= bar.open_price else red
+
+        ax_price.vlines(index, low_price, high_price, color=color, linewidth=0.9, alpha=0.95)
+        body_bottom = min(open_price, close_price)
+        body_height = max(abs(close_price - open_price), body_min_height)
+        ax_price.add_patch(
+            Rectangle(
+                (index - candle_width / 2, body_bottom),
+                candle_width,
+                body_height,
+                facecolor=color,
+                edgecolor=color,
+                linewidth=0.7,
+            )
+        )
+        ax_volume.bar(
+            index,
+            float(bar.volume),
+            width=candle_width,
+            color=color,
+            alpha=0.5,
+            linewidth=0,
+        )
+
+    last_bar = bars[-1]
+    previous_close = bars[-2].close_price
+    change = last_bar.close_price - previous_close
+    change_percent = Decimal("0") if previous_close == 0 else (change / previous_close) * Decimal("100")
+    sign = "+" if change >= 0 else ""
+    change_color = green if change >= 0 else red
+
+    ax_price.set_xlim(-1, len(bars))
+    ax_price.set_ylim(price_min, price_max)
+    ax_price.yaxis.set_major_formatter(FuncFormatter(lambda value, _pos: f"{value:,.2f}"))
+    ax_price.axhline(float(last_bar.close_price), color=change_color, linestyle="--", linewidth=0.8, alpha=0.6)
+    ax_price.text(
+        1.006,
+        float(last_bar.close_price),
+        format_chart_price(last_bar.close_price),
+        transform=ax_price.get_yaxis_transform(),
+        va="center",
+        ha="left",
+        fontsize=8,
+        color="#ffffff",
+        bbox={"boxstyle": "round,pad=0.18", "facecolor": change_color, "edgecolor": change_color},
+    )
+
+    tick_positions = build_chart_ticks(len(bars), 8)
+    ax_volume.set_xticks(tick_positions)
+    ax_volume.set_xticklabels(
+        [format_chart_time(bars[position].open_time_ms, chart.interval) for position in tick_positions],
+        color="#9aa4af",
+        fontsize=8,
+    )
+    ax_volume.set_yticks([])
+    ax_price.tick_params(labelbottom=False)
+
+    fig.text(0.045, 0.945, "CryptoWhale", color="#ff4d5a", fontsize=16, fontweight="bold", ha="left")
+    fig.text(
+        0.045,
+        0.905,
+        f"{chart.asset} / TetherUS - {chart.interval} - Binance",
+        color="#e8edf2",
+        fontsize=10,
+        ha="left",
+    )
+    fig.text(
+        0.255,
+        0.905,
+        (
+            f"O {format_chart_price(last_bar.open_price)}  "
+            f"H {format_chart_price(last_bar.high_price)}  "
+            f"L {format_chart_price(last_bar.low_price)}  "
+            f"C {format_chart_price(last_bar.close_price)}  "
+            f"{sign}{format_decimal(change)} ({sign}{format_decimal(change_percent.quantize(Decimal('0.01')))}%)"
+        ),
+        color=change_color,
+        fontsize=8,
+        ha="left",
+    )
+    ax_volume.text(
+        0.01,
+        0.78,
+        f"Vol {chart.asset} {format_decimal(last_bar.volume)}",
+        transform=ax_volume.transAxes,
+        color="#9aa4af",
+        fontsize=8,
+        ha="left",
+    )
+    fig.text(0.07, 0.115, "CryptoWhaleBot", color="#dbe4ee", fontsize=9, fontweight="bold", alpha=0.92)
+    fig.patches.append(
+        Rectangle((0.01, 0.01), 0.98, 0.98, transform=fig.transFigure, fill=False, edgecolor="#00fff0", linewidth=3)
+    )
+
+    image = BytesIO()
+    fig.savefig(image, format="png", facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0.06)
+    plt.close(fig)
+    return image.getvalue()
 
 
 class TelegramBot:
@@ -389,9 +619,12 @@ class TelegramBot:
         except BotError as exc:
             reply = f"{exc}\n\nKetik /help untuk contoh command."
 
-        self.send_message(chat_id, reply)
+        if isinstance(reply, PhotoReply):
+            self.send_photo(chat_id, reply.photo, reply.caption, reply.filename)
+        else:
+            self.send_message(chat_id, reply)
 
-    def build_reply(self, text: str) -> str:
+    def build_reply(self, text: str) -> str | PhotoReply:
         command = strip_bot_mention(text)
         lower = command.lower().strip()
 
@@ -407,6 +640,8 @@ class TelegramBot:
             return self.reply_convert(request["amount"], request["coin"], request["currency"])
         if request["kind"] == "kline":
             return self.reply_kline(request["coin"], request["timeframe"])
+        if request["kind"] == "chart":
+            return self.reply_chart(request["coin"], request["timeframe"])
 
         raise BotError("Command belum dikenali.")
 
@@ -460,6 +695,12 @@ class TelegramBot:
             ]
         )
 
+    def reply_chart(self, coin: str, timeframe: str) -> PhotoReply:
+        result = self.price_client.get_klines(coin, timeframe)
+        photo = render_candlestick_chart(result)
+        caption = f"CryptoWhale\n{result.symbol} {result.interval} - Binance Spot"
+        return PhotoReply(photo=photo, caption=caption, filename=f"{result.symbol}_{result.interval}.png")
+
     def send_message(self, chat_id: int, text: str) -> None:
         self.telegram_request(
             "sendMessage",
@@ -470,16 +711,44 @@ class TelegramBot:
             },
         )
 
+    def send_photo(self, chat_id: int, photo: bytes, caption: str, filename: str) -> None:
+        self.telegram_upload(
+            "sendPhoto",
+            fields={
+                "chat_id": chat_id,
+                "caption": caption,
+            },
+            files={
+                "photo": (filename, "image/png", photo),
+            },
+        )
+
     def telegram_request(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = TELEGRAM_API_BASE.format(token=self.token, method=method)
         return http_post_json(url, payload)
+
+    def telegram_upload(
+        self,
+        method: str,
+        fields: dict[str, Any],
+        files: dict[str, tuple[str, str, bytes]],
+    ) -> dict[str, Any]:
+        url = TELEGRAM_API_BASE.format(token=self.token, method=method)
+        return http_post_multipart_json(url, fields, files)
 
 
 def parse_user_request(text: str) -> dict[str, Any]:
     clean = text.strip()
     lower = clean.lower()
 
-    if lower.startswith(("/kline", "/candle", "/chart", "/tf")):
+    if lower.startswith(("/tv", "/chart")):
+        parts = clean.split()
+        if len(parts) < 2:
+            raise BotError("Format: /tv btc atau /tv btc 15m")
+        timeframe = normalize_timeframe(parts[2]) if len(parts) >= 3 else "1h"
+        return {"kind": "chart", "coin": parts[1], "timeframe": timeframe}
+
+    if lower.startswith(("/kline", "/candle", "/tf")):
         parts = clean.split()
         if len(parts) < 3:
             raise BotError("Format: /kline btc 15m")
@@ -491,7 +760,7 @@ def parse_user_request(text: str) -> dict[str, Any]:
             raise BotError("Format: /price btc, /price eth idr, atau /price btc 15m")
         coin = parts[1]
         if len(parts) >= 3 and is_timeframe(parts[2]):
-            return {"kind": "kline", "coin": coin, "timeframe": normalize_timeframe(parts[2])}
+            return {"kind": "chart", "coin": coin, "timeframe": normalize_timeframe(parts[2])}
         currency = normalize_currency(parts[2]) if len(parts) >= 3 else None
         return {"kind": "price", "coin": coin, "currency": currency}
 
@@ -518,7 +787,7 @@ def parse_user_request(text: str) -> dict[str, Any]:
 
     parts = clean.split()
     if len(parts) == 2 and is_timeframe(parts[1]):
-        return {"kind": "kline", "coin": parts[0], "timeframe": normalize_timeframe(parts[1])}
+        return {"kind": "chart", "coin": parts[0], "timeframe": normalize_timeframe(parts[1])}
 
     quick_price = re.fullmatch(r"(?P<coin>[a-zA-Z0-9$._-]+)(?:\s+(?P<currency>usd|usdt|idr))?", lower)
     if quick_price:
@@ -607,6 +876,58 @@ def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def http_post_multipart_json(
+    url: str,
+    fields: dict[str, Any],
+    files: dict[str, tuple[str, str, bytes]],
+) -> dict[str, Any]:
+    boundary = f"----CryptoWhaleBoundary{secrets.token_hex(16)}"
+    body_parts: list[bytes] = []
+
+    for name, value in fields.items():
+        body_parts.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    for name, (filename, content_type, content) in files.items():
+        body_parts.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                (
+                    f'Content-Disposition: form-data; name="{name}"; '
+                    f'filename="{filename}"\r\n'
+                ).encode("utf-8"),
+                f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+                content,
+                b"\r\n",
+            ]
+        )
+
+    body_parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(body_parts)
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+            "User-Agent": "crypto-telegram-converter/2.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS + POLL_TIMEOUT_SECONDS) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    if not data.get("ok"):
+        description = data.get("description", "Telegram API error")
+        raise BotError(description)
+    return data
+
+
 def parse_error_message(body: str) -> str | None:
     try:
         data = json.loads(body)
@@ -683,6 +1004,12 @@ def format_quote_money(value: Decimal, quote_asset: str) -> str:
     return f"{quote_asset} {format_small_decimal(value)}"
 
 
+def format_chart_price(value: Decimal) -> str:
+    if value >= Decimal("1"):
+        return f"{value.quantize(Decimal('0.01')):,.2f}"
+    return format_small_decimal(value)
+
+
 def format_decimal(value: Decimal) -> str:
     text = format(value.normalize(), "f")
     if "." in text:
@@ -706,6 +1033,22 @@ def format_datetime(dt: datetime) -> str:
 def format_ms_timestamp(timestamp_ms: int) -> str:
     dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
     return format_datetime(dt)
+
+
+def format_chart_time(timestamp_ms: int, interval: str) -> str:
+    dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+    if interval.endswith("m") or interval.endswith("h"):
+        return dt.strftime("%d %b\n%H:%M")
+    if interval.endswith("d") or interval.endswith("w"):
+        return dt.strftime("%d %b")
+    return dt.strftime("%b %Y")
+
+
+def build_chart_ticks(length: int, target_count: int) -> list[int]:
+    if length <= 1:
+        return [0]
+    count = max(2, min(target_count, length))
+    return sorted({round(index * (length - 1) / (count - 1)) for index in range(count)})
 
 
 def main() -> int:
