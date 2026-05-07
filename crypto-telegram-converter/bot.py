@@ -428,7 +428,9 @@ def render_candlestick_chart(chart: ChartResult) -> bytes:
         from matplotlib.ticker import FuncFormatter
     except ModuleNotFoundError as exc:
         raise BotError(
-            "Fitur chart membutuhkan matplotlib. Jalankan di VPS: pip3 install -r requirements.txt"
+            "Fitur chart membutuhkan matplotlib. Di Ubuntu/Debian baru, jalankan: "
+            "sudo apt update && sudo apt install -y python3-matplotlib. "
+            "Alternatif: pakai virtualenv lalu pip install -r requirements.txt."
         ) from exc
 
     bars = chart.bars
