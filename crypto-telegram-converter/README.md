@@ -6,6 +6,7 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 
 - `/price btc` menampilkan harga BTC ke USD dan IDR.
 - `/price eth idr` menampilkan harga ETH ke IDR.
+- `/p btc` menampilkan ringkasan harga, H/L, perubahan 1h/24h/7d/30d, ATH, volume, dan market cap.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
 - `/convert 250 doge idr` mengonversi jumlah coin ke IDR.
 - `/tv eth` mengirim gambar chart ETHUSDT timeframe default 1h.
@@ -56,6 +57,7 @@ python3 bot.py
 
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
+- Command `/p` memakai CoinGecko untuk data market lengkap seperti ATH, market cap, volume, dan perubahan 7d/30d.
 - Bot mencoba beberapa endpoint Binance secara berurutan, termasuk `data-api.binance.vision` untuk market data.
 - Chart dibuat lokal di VPS dengan `matplotlib`, lalu dikirim ke Telegram sebagai foto.
 - Harga USD memakai pair USDT Binance, misalnya BTCUSDT.

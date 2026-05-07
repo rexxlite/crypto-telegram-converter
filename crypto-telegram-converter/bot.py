@@ -27,6 +27,7 @@ from typing import Any
 
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 BINANCE_API_BASE = "https://api.binance.com"
+COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 BINANCE_API_BASES = (
     "https://api.binance.com",
     "https://data-api.binance.vision",
@@ -42,6 +43,7 @@ REQUEST_TIMEOUT_SECONDS = 20
 POLL_TIMEOUT_SECONDS = 35
 PRICE_CACHE_SECONDS = 5
 KLINE_CACHE_SECONDS = 5
+MARKET_STATS_CACHE_SECONDS = 30
 CHART_CANDLE_LIMIT = 134
 
 BINANCE_TIMEFRAMES = (
@@ -109,10 +111,32 @@ COMMON_COINS = {
     "usd-coin": "USDC",
 }
 
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "BNB": "binancecoin",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "ADA": "cardano",
+    "DOGE": "dogecoin",
+    "DOT": "polkadot",
+    "TRX": "tron",
+    "LTC": "litecoin",
+    "BCH": "bitcoin-cash",
+    "LINK": "chainlink",
+    "AVAX": "avalanche-2",
+    "TON": "the-open-network",
+    "SHIB": "shiba-inu",
+    "PEPE": "pepe",
+    "USDT": "tether",
+    "USDC": "usd-coin",
+}
+
 HELP_TEXT = f"""Halo! Kirim command seperti ini:
 
 /price btc
 /price eth idr
+/p btc
 /convert 0.5 btc usd
 /convert 250 doge idr
 /tv eth
@@ -201,6 +225,124 @@ class PhotoReply:
     photo: bytes
     caption: str
     filename: str = "chart.png"
+
+
+@dataclass
+class MarketStats:
+    asset: str
+    name: str
+    price: Decimal
+    btc_value: Decimal
+    eth_value: Decimal
+    high_24h: Decimal | None
+    low_24h: Decimal | None
+    change_1h: Decimal | None
+    change_24h: Decimal | None
+    change_7d: Decimal | None
+    change_30d: Decimal | None
+    ath: Decimal | None
+    ath_change_percent: Decimal | None
+    volume_24h: Decimal | None
+    market_cap: Decimal | None
+    updated_at: str | None
+
+
+class MarketStatsClient:
+    def __init__(self, api_base: str = COINGECKO_API_BASE) -> None:
+        self.api_base = api_base.rstrip("/")
+        self._cache: dict[str, tuple[float, MarketStats]] = {}
+
+    def resolve_coin_id(self, coin_text: str) -> tuple[str, str]:
+        normalized = coin_text.strip().replace("$", "").replace("-", "").replace("_", "")
+        if not normalized:
+            raise BotError("Nama coin belum diisi. Contoh: /p btc")
+
+        asset = COMMON_COINS.get(normalized.lower(), normalized.upper())
+        coin_id = COINGECKO_IDS.get(asset)
+        if not coin_id:
+            coin_id = normalized.lower()
+        return asset, coin_id
+
+    def get_stats(self, coin_text: str) -> MarketStats:
+        asset, coin_id = self.resolve_coin_id(coin_text)
+        cached = self._cache.get(coin_id)
+        now = time.time()
+        if cached and now - cached[0] <= MARKET_STATS_CACHE_SECONDS:
+            return cached[1]
+
+        ids = sorted({coin_id, "bitcoin", "ethereum"})
+        payload = self.coingecko_get_json(
+            "/coins/markets",
+            {
+                "vs_currency": "usd",
+                "ids": ",".join(ids),
+                "order": "market_cap_desc",
+                "per_page": str(len(ids)),
+                "page": "1",
+                "sparkline": "false",
+                "price_change_percentage": "1h,24h,7d,30d",
+                "locale": "en",
+                "precision": "full",
+            },
+        )
+        if not isinstance(payload, list) or not payload:
+            raise BotError(f"Coin '{coin_text}' tidak ditemukan di CoinGecko.")
+
+        by_id = {item.get("id"): item for item in payload if isinstance(item, dict)}
+        target = by_id.get(coin_id)
+        bitcoin = by_id.get("bitcoin")
+        ethereum = by_id.get("ethereum")
+        if not target:
+            raise BotError(f"Coin '{coin_text}' tidak ditemukan di CoinGecko.")
+        if not bitcoin or not ethereum:
+            raise BotError("Data pembanding BTC/ETH belum tersedia dari CoinGecko.")
+
+        price = decimal_from_payload(target, "current_price")
+        btc_price = decimal_from_payload(bitcoin, "current_price")
+        eth_price = decimal_from_payload(ethereum, "current_price")
+        if price is None or btc_price in {None, Decimal("0")} or eth_price in {None, Decimal("0")}:
+            raise BotError("Data harga belum lengkap dari CoinGecko.")
+
+        stats = MarketStats(
+            asset=(target.get("symbol") or asset).upper(),
+            name=str(target.get("name") or asset),
+            price=price,
+            btc_value=price / btc_price,
+            eth_value=price / eth_price,
+            high_24h=decimal_from_payload(target, "high_24h"),
+            low_24h=decimal_from_payload(target, "low_24h"),
+            change_1h=decimal_from_payload(target, "price_change_percentage_1h_in_currency"),
+            change_24h=decimal_from_payload(target, "price_change_percentage_24h_in_currency")
+            or decimal_from_payload(target, "price_change_percentage_24h"),
+            change_7d=decimal_from_payload(target, "price_change_percentage_7d_in_currency"),
+            change_30d=decimal_from_payload(target, "price_change_percentage_30d_in_currency"),
+            ath=decimal_from_payload(target, "ath"),
+            ath_change_percent=decimal_from_payload(target, "ath_change_percentage"),
+            volume_24h=decimal_from_payload(target, "total_volume"),
+            market_cap=decimal_from_payload(target, "market_cap"),
+            updated_at=target.get("last_updated") if isinstance(target.get("last_updated"), str) else None,
+        )
+        self._cache[coin_id] = (now, stats)
+        return stats
+
+    def coingecko_get_json(self, path: str, params: dict[str, Any]) -> Any:
+        query = urllib.parse.urlencode(params)
+        url = f"{self.api_base}{path}?{query}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "crypto-telegram-converter/2.0",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            message = parse_error_message(body) or str(exc)
+            raise BotError(f"CoinGecko API error ({exc.code}): {message}") from exc
 
 
 class BinanceMarketClient:
@@ -573,9 +715,15 @@ def render_candlestick_chart(chart: ChartResult) -> bytes:
 
 
 class TelegramBot:
-    def __init__(self, token: str, price_client: BinanceMarketClient) -> None:
+    def __init__(
+        self,
+        token: str,
+        price_client: BinanceMarketClient,
+        stats_client: MarketStatsClient,
+    ) -> None:
         self.token = token
         self.price_client = price_client
+        self.stats_client = stats_client
         self.offset = load_offset()
 
     def run_forever(self) -> None:
@@ -637,6 +785,8 @@ class TelegramBot:
         request = parse_user_request(command)
         if request["kind"] == "price":
             return self.reply_price(request["coin"], request["currency"])
+        if request["kind"] == "stats":
+            return self.reply_market_stats(request["coin"])
         if request["kind"] == "convert":
             return self.reply_convert(request["amount"], request["coin"], request["currency"])
         if request["kind"] == "kline":
@@ -661,6 +811,10 @@ class TelegramBot:
         lines.append(f"\nUpdate: {format_datetime(result.updated_at)}")
         lines.append("Sumber: Binance Spot")
         return "\n".join(lines)
+
+    def reply_market_stats(self, coin: str) -> str:
+        stats = self.stats_client.get_stats(coin)
+        return format_market_stats(stats)
 
     def reply_convert(self, amount: Decimal, coin: str, currency: str) -> str:
         target = currency.lower()
@@ -742,6 +896,14 @@ def parse_user_request(text: str) -> dict[str, Any]:
     clean = text.strip()
     lower = clean.lower()
 
+    parts = clean.split()
+    first = parts[0].split("@", 1)[0].lower() if parts else ""
+
+    if first in {"/p", "/stats"}:
+        if len(parts) < 2:
+            raise BotError("Format: /p btc")
+        return {"kind": "stats", "coin": parts[1]}
+
     if lower.startswith(("/tv", "/chart")):
         parts = clean.split()
         if len(parts) < 2:
@@ -786,7 +948,6 @@ def parse_user_request(text: str) -> dict[str, Any]:
             "currency": normalize_currency(quick_convert.group("currency")),
         }
 
-    parts = clean.split()
     if len(parts) == 2 and is_timeframe(parts[1]):
         return {"kind": "chart", "coin": parts[0], "timeframe": normalize_timeframe(parts[1])}
 
@@ -848,6 +1009,38 @@ def parse_amount(raw_amount: str) -> Decimal:
     if amount <= 0:
         raise BotError("Jumlah crypto harus lebih dari 0.")
     return amount
+
+
+def decimal_from_payload(payload: dict[str, Any], key: str) -> Decimal | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def format_market_stats(stats: MarketStats) -> str:
+    return "\n".join(
+        [
+            f"Price: {format_usd_price(stats.price)}",
+            f"⤷ ₿ {format_asset_amount(stats.btc_value)} | Ξ {format_asset_amount(stats.eth_value)}",
+            f"⚖️ H/L: {format_optional_usd(stats.high_24h)} | {format_optional_usd(stats.low_24h)}",
+            format_percent_line("1h", stats.change_1h, "🚀"),
+            format_percent_line("24h", stats.change_24h, "🚀"),
+            format_percent_line("7d", stats.change_7d, "🚀"),
+            format_percent_line("30d", stats.change_30d, "🌕"),
+            f"🏆 ATH: {format_optional_usd(stats.ath)} ({format_optional_percent(stats.ath_change_percent)})",
+            f"📊 24h Vol: {format_optional_compact_usd(stats.volume_24h)}",
+            f"💎 MCap: {format_optional_compact_usd(stats.market_cap)}",
+        ]
+    )
+
+
+def format_percent_line(label: str, percent: Decimal | None, positive_icon: str) -> str:
+    icon = "📉" if percent is not None and percent < 0 else positive_icon
+    return f"{icon} {label}: {format_optional_percent(percent)}"
 
 
 def reply_timeframes() -> str:
@@ -999,6 +1192,50 @@ def format_money(value: Decimal, currency: str) -> str:
     return format_quote_money(value, currency.upper())
 
 
+def format_usd_price(value: Decimal) -> str:
+    if value >= Decimal("1000"):
+        return f"${value.quantize(Decimal('1')):,.0f}"
+    if value >= Decimal("1"):
+        return f"${value.quantize(Decimal('0.01')):,.2f}"
+    return f"${format_small_decimal(value)}"
+
+
+def format_optional_usd(value: Decimal | None) -> str:
+    return format_usd_price(value) if value is not None else "N/A"
+
+
+def format_optional_percent(value: Decimal | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{format_decimal(value.quantize(Decimal('0.01')))}%"
+
+
+def format_optional_compact_usd(value: Decimal | None) -> str:
+    return format_compact_usd(value) if value is not None else "N/A"
+
+
+def format_compact_usd(value: Decimal) -> str:
+    units = (
+        (Decimal("1000000000000"), "T"),
+        (Decimal("1000000000"), "B"),
+        (Decimal("1000000"), "M"),
+        (Decimal("1000"), "K"),
+    )
+    abs_value = abs(value)
+    for divisor, suffix in units:
+        if abs_value >= divisor:
+            return f"${format_decimal((value / divisor).quantize(Decimal('0.01')))}{suffix}"
+    return format_usd_price(value)
+
+
+def format_asset_amount(value: Decimal) -> str:
+    if value >= Decimal("1"):
+        return f"{value.quantize(Decimal('0.01')):,.2f}"
+    if value >= Decimal("0.0001"):
+        return format_decimal(value.quantize(Decimal("0.000001")))
+    return format_small_decimal(value)
+
+
 def format_quote_money(value: Decimal, quote_asset: str) -> str:
     if value >= Decimal("1"):
         return f"{quote_asset} {value.quantize(Decimal('0.01')):,.2f}"
@@ -1060,7 +1297,12 @@ def main() -> int:
         return 1
 
     api_bases = parse_api_bases(os.environ.get("BINANCE_API_BASES") or os.environ.get("BINANCE_API_BASE"))
-    bot = TelegramBot(token=token, price_client=BinanceMarketClient(api_bases=api_bases))
+    coingecko_api_base = os.environ.get("COINGECKO_API_BASE", COINGECKO_API_BASE)
+    bot = TelegramBot(
+        token=token,
+        price_client=BinanceMarketClient(api_bases=api_bases),
+        stats_client=MarketStatsClient(api_base=coingecko_api_base),
+    )
     bot.run_forever()
     return 0
 
