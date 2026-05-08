@@ -145,6 +145,7 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /price btc
 /price eth idr
 /p btc
+/mp btc sol eth
 /gas
 /convert 0.5 btc usd
 /convert 250 doge idr
@@ -427,6 +428,100 @@ class MarketStatsClient:
         )
         self._cache[coin_id] = (now, stats)
         return stats
+
+    def get_multi_stats(self, coin_texts: list[str]) -> list[MarketStats]:
+        requested: list[tuple[str, str]] = []
+        seen_ids: set[str] = set()
+        for coin_text in coin_texts:
+            asset, coin_id = self.resolve_coin_id(coin_text)
+            if coin_id in seen_ids:
+                continue
+            requested.append((asset, coin_id))
+            seen_ids.add(coin_id)
+
+        if not requested:
+            raise BotError("Format: /mp btc sol eth")
+
+        now = time.time()
+        results: dict[str, MarketStats] = {}
+        missing: list[tuple[str, str]] = []
+        for asset, coin_id in requested:
+            cached = self._cache.get(coin_id)
+            if cached and now - cached[0] <= MARKET_STATS_CACHE_SECONDS:
+                results[coin_id] = cached[1]
+            else:
+                missing.append((asset, coin_id))
+
+        if missing:
+            ids = sorted({coin_id for _asset, coin_id in missing} | {"bitcoin", "ethereum"})
+            payload = self.coingecko_get_json(
+                "/coins/markets",
+                {
+                    "vs_currency": "usd",
+                    "ids": ",".join(ids),
+                    "order": "market_cap_desc",
+                    "per_page": str(len(ids)),
+                    "page": "1",
+                    "sparkline": "false",
+                    "price_change_percentage": "1h,24h,7d,30d",
+                    "locale": "en",
+                    "precision": "full",
+                },
+            )
+            if not isinstance(payload, list) or not payload:
+                raise BotError("Coin tidak ditemukan di CoinGecko.")
+
+            by_id = {item.get("id"): item for item in payload if isinstance(item, dict)}
+            bitcoin = by_id.get("bitcoin")
+            ethereum = by_id.get("ethereum")
+            if not bitcoin or not ethereum:
+                raise BotError("Data pembanding BTC/ETH belum tersedia dari CoinGecko.")
+
+            btc_price = decimal_from_payload(bitcoin, "current_price")
+            eth_price = decimal_from_payload(ethereum, "current_price")
+            if btc_price in {None, Decimal("0")} or eth_price in {None, Decimal("0")}:
+                raise BotError("Data harga BTC/ETH belum lengkap dari CoinGecko.")
+
+            for asset, coin_id in missing:
+                target = by_id.get(coin_id)
+                if not target:
+                    raise BotError(f"Coin '{asset}' tidak ditemukan di CoinGecko.")
+                stats = self.build_market_stats(asset, target, btc_price, eth_price)
+                self._cache[coin_id] = (now, stats)
+                results[coin_id] = stats
+
+        return [results[coin_id] for _asset, coin_id in requested]
+
+    def build_market_stats(
+        self,
+        fallback_asset: str,
+        target: dict[str, Any],
+        btc_price: Decimal,
+        eth_price: Decimal,
+    ) -> MarketStats:
+        price = decimal_from_payload(target, "current_price")
+        if price is None:
+            raise BotError("Data harga belum lengkap dari CoinGecko.")
+
+        return MarketStats(
+            asset=(target.get("symbol") or fallback_asset).upper(),
+            name=str(target.get("name") or fallback_asset),
+            price=price,
+            btc_value=price / btc_price,
+            eth_value=price / eth_price,
+            high_24h=decimal_from_payload(target, "high_24h"),
+            low_24h=decimal_from_payload(target, "low_24h"),
+            change_1h=decimal_from_payload(target, "price_change_percentage_1h_in_currency"),
+            change_24h=decimal_from_payload(target, "price_change_percentage_24h_in_currency")
+            or decimal_from_payload(target, "price_change_percentage_24h"),
+            change_7d=decimal_from_payload(target, "price_change_percentage_7d_in_currency"),
+            change_30d=decimal_from_payload(target, "price_change_percentage_30d_in_currency"),
+            ath=decimal_from_payload(target, "ath"),
+            ath_change_percent=decimal_from_payload(target, "ath_change_percentage"),
+            volume_24h=decimal_from_payload(target, "total_volume"),
+            market_cap=decimal_from_payload(target, "market_cap"),
+            updated_at=target.get("last_updated") if isinstance(target.get("last_updated"), str) else None,
+        )
 
     def coingecko_get_json(self, path: str, params: dict[str, Any]) -> Any:
         query = urllib.parse.urlencode(params)
@@ -896,6 +991,8 @@ class TelegramBot:
             return self.reply_price(request["coin"], request["currency"])
         if request["kind"] == "stats":
             return self.reply_market_stats(request["coin"])
+        if request["kind"] == "multi_stats":
+            return self.reply_multi_market_stats(request["coins"])
         if request["kind"] == "convert":
             return self.reply_convert(request["amount"], request["coin"], request["currency"])
         if request["kind"] == "kline":
@@ -924,6 +1021,10 @@ class TelegramBot:
     def reply_market_stats(self, coin: str) -> str:
         stats = self.stats_client.get_stats(coin)
         return format_market_stats(stats)
+
+    def reply_multi_market_stats(self, coins: list[str]) -> str:
+        stats = self.stats_client.get_multi_stats(coins)
+        return format_multi_market_stats(stats)
 
     def reply_gas(self) -> str:
         return format_gas_estimate(self.gas_client.get_gas())
@@ -1015,6 +1116,14 @@ def parse_user_request(text: str) -> dict[str, Any]:
         if len(parts) < 2:
             raise BotError("Format: /p btc")
         return {"kind": "stats", "coin": parts[1]}
+
+    if first in {"/mp", "/multi", "/prices"}:
+        if len(parts) < 2:
+            raise BotError("Format: /mp btc sol eth")
+        coins = parts[1:]
+        if len(coins) > 6:
+            raise BotError("Maksimal 6 coin per request. Contoh: /mp btc sol eth")
+        return {"kind": "multi_stats", "coins": coins}
 
     if lower.startswith(("/tv", "/chart")):
         parts = clean.split()
@@ -1153,6 +1262,28 @@ def format_market_stats(stats: MarketStats) -> str:
 def format_percent_line(label: str, percent: Decimal | None, positive_icon: str) -> str:
     icon = "📉" if percent is not None and percent < 0 else positive_icon
     return f"{icon} {label}: {format_optional_percent(percent)}"
+
+
+def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
+    lines = ["📊 Market Prices"]
+    for index, stats in enumerate(stats_list):
+        if index:
+            lines.append("")
+        lines.extend(
+            [
+                f"{stats.asset}: {format_usd_price(stats.price)}",
+                (
+                    f"1h: {format_optional_percent(stats.change_1h)} | "
+                    f"24h: {format_optional_percent(stats.change_24h)} | "
+                    f"7d: {format_optional_percent(stats.change_7d)}"
+                ),
+                (
+                    f"Vol: {format_optional_compact_usd(stats.volume_24h)} | "
+                    f"MCap: {format_optional_compact_usd(stats.market_cap)}"
+                ),
+            ]
+        )
+    return "\n".join(lines)
 
 
 def format_gas_estimate(estimate: GasEstimate) -> str:

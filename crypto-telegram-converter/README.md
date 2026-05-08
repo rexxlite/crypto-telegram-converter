@@ -7,6 +7,7 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/price btc` menampilkan harga BTC ke USD dan IDR.
 - `/price eth idr` menampilkan harga ETH ke IDR.
 - `/p btc` menampilkan ringkasan harga, H/L, perubahan 1h/24h/7d/30d, ATH, volume, dan market cap.
+- `/mp btc sol eth` menampilkan ringkasan harga beberapa coin sekaligus.
 - `/gas` menampilkan gas Ethereum realtime dalam gwei.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
 - `/convert 250 doge idr` mengonversi jumlah coin ke IDR.
