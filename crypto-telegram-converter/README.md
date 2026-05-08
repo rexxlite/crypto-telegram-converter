@@ -14,7 +14,6 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/tv eth 15m` mengirim gambar chart ETHUSDT timeframe 15 menit.
 - `/kline btc 15m` menampilkan candle BTCUSDT timeframe 15 menit dalam bentuk teks.
 - `/timeframes` menampilkan daftar timeframe Binance yang didukung.
-- Format cepat: `btc`, `eth idr`, `btc 15m`, `eth 30m`, `0.1 btc to idr`.
 
 ## Cara Menjalankan
 
@@ -64,6 +63,7 @@ python3 bot.py
 ## Catatan
 
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
+- Bot hanya merespons command yang diawali `/`; pesan biasa di private chat atau grup akan diabaikan.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
 - Command `/p` memakai CoinGecko untuk data market lengkap seperti ATH, market cap, volume, dan perubahan 7d/30d.
 - Command `/gas` memakai Etherscan Gas Oracle jika `ETHERSCAN_API_KEY` diisi, lalu fallback ke public Ethereum RPC `eth_feeHistory`.

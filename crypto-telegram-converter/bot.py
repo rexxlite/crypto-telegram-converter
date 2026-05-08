@@ -153,13 +153,6 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /kline btc 15m
 /timeframes
 
-Format cepat juga bisa:
-btc
-eth idr
-btc 15m
-eth 30m
-0.1 btc to idr
-
 Chart dikirim sebagai gambar candlestick.
 Timeframe Binance yang tersedia:
 {", ".join(BINANCE_TIMEFRAMES)}
@@ -874,6 +867,8 @@ class TelegramBot:
 
         if chat_id is None or not text:
             return
+        if not text.startswith("/"):
+            return
 
         try:
             reply = self.build_reply(text)
@@ -889,11 +884,11 @@ class TelegramBot:
         command = strip_bot_mention(text)
         lower = command.lower().strip()
 
-        if lower in {"/start", "start", "/help", "help"}:
+        if lower in {"/start", "/help"}:
             return HELP_TEXT
-        if lower in {"/timeframes", "timeframes", "/tf", "tf"}:
+        if lower in {"/timeframes", "/tf"}:
             return reply_timeframes()
-        if lower in {"/gas", "gas"}:
+        if lower == "/gas":
             return self.reply_gas()
 
         request = parse_user_request(command)
