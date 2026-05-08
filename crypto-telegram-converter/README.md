@@ -7,6 +7,7 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/price btc` menampilkan harga BTC ke USD dan IDR.
 - `/price eth idr` menampilkan harga ETH ke IDR.
 - `/p btc` menampilkan ringkasan harga, H/L, perubahan 1h/24h/7d/30d, ATH, volume, dan market cap.
+- `/gas` menampilkan gas Ethereum realtime dalam gwei.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
 - `/convert 250 doge idr` mengonversi jumlah coin ke IDR.
 - `/tv eth` mengirim gambar chart ETHUSDT timeframe default 1h.
@@ -29,6 +30,13 @@ Jika VPS kamu mendapat error Binance `451 restricted location`, coba tambahkan e
 
 ```env
 BINANCE_API_BASES=https://data-api.binance.vision,https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com,https://api4.binance.com
+```
+
+Opsional untuk `/gas`: isi API key Etherscan kalau kamu punya. Kalau tidak diisi, bot memakai public Ethereum RPC.
+
+```env
+ETHERSCAN_API_KEY=isi_api_key_etherscan
+ETH_RPC_URLS=https://ethereum.publicnode.com,https://rpc.flashbots.net,https://cloudflare-eth.com
 ```
 
 4. Install dependency chart:
@@ -58,6 +66,7 @@ python3 bot.py
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
 - Command `/p` memakai CoinGecko untuk data market lengkap seperti ATH, market cap, volume, dan perubahan 7d/30d.
+- Command `/gas` memakai Etherscan Gas Oracle jika `ETHERSCAN_API_KEY` diisi, lalu fallback ke public Ethereum RPC `eth_feeHistory`.
 - Bot mencoba beberapa endpoint Binance secara berurutan, termasuk `data-api.binance.vision` untuk market data.
 - Chart dibuat lokal di VPS dengan `matplotlib`, lalu dikirim ke Telegram sebagai foto.
 - Harga USD memakai pair USDT Binance, misalnya BTCUSDT.

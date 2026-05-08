@@ -28,6 +28,12 @@ from typing import Any
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 BINANCE_API_BASE = "https://api.binance.com"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
+ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api"
+ETH_RPC_URLS = (
+    "https://ethereum.publicnode.com",
+    "https://rpc.flashbots.net",
+    "https://cloudflare-eth.com",
+)
 BINANCE_API_BASES = (
     "https://api.binance.com",
     "https://data-api.binance.vision",
@@ -44,7 +50,9 @@ POLL_TIMEOUT_SECONDS = 35
 PRICE_CACHE_SECONDS = 5
 KLINE_CACHE_SECONDS = 5
 MARKET_STATS_CACHE_SECONDS = 30
+GAS_CACHE_SECONDS = 15
 CHART_CANDLE_LIMIT = 134
+WEI_PER_GWEI = Decimal("1000000000")
 
 BINANCE_TIMEFRAMES = (
     "1s",
@@ -137,6 +145,7 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /price btc
 /price eth idr
 /p btc
+/gas
 /convert 0.5 btc usd
 /convert 250 doge idr
 /tv eth
@@ -245,6 +254,107 @@ class MarketStats:
     volume_24h: Decimal | None
     market_cap: Decimal | None
     updated_at: str | None
+
+
+@dataclass
+class GasEstimate:
+    safe_gwei: Decimal
+    standard_gwei: Decimal
+    fast_gwei: Decimal
+    base_fee_gwei: Decimal | None
+    last_block: str | None
+    gas_used_ratio: Decimal | None
+    source: str
+
+
+class GasClient:
+    def __init__(
+        self,
+        etherscan_api_key: str | None = None,
+        etherscan_api_base: str = ETHERSCAN_API_BASE,
+        rpc_urls: tuple[str, ...] = ETH_RPC_URLS,
+    ) -> None:
+        self.etherscan_api_key = etherscan_api_key.strip() if etherscan_api_key else None
+        self.etherscan_api_base = etherscan_api_base.rstrip("/")
+        self.rpc_urls = tuple(url.rstrip("/") for url in rpc_urls if url.strip()) or ETH_RPC_URLS
+        self._cache: tuple[float, GasEstimate] | None = None
+
+    def get_gas(self) -> GasEstimate:
+        now = time.time()
+        if self._cache and now - self._cache[0] <= GAS_CACHE_SECONDS:
+            return self._cache[1]
+
+        errors: list[str] = []
+        if self.etherscan_api_key:
+            try:
+                estimate = self.get_etherscan_gas()
+                self._cache = (now, estimate)
+                return estimate
+            except BotError as exc:
+                errors.append(str(exc))
+
+        try:
+            estimate = self.get_rpc_gas()
+            self._cache = (now, estimate)
+            return estimate
+        except BotError as exc:
+            errors.append(str(exc))
+
+        raise BotError("Gagal mengambil gas Ethereum: " + " | ".join(errors))
+
+    def get_etherscan_gas(self) -> GasEstimate:
+        payload = generic_get_json(
+            self.etherscan_api_base,
+            {
+                "chainid": "1",
+                "module": "gastracker",
+                "action": "gasoracle",
+                "apikey": self.etherscan_api_key,
+            },
+        )
+        if not isinstance(payload, dict) or payload.get("status") != "1":
+            message = payload.get("message") if isinstance(payload, dict) else "response tidak valid"
+            raise BotError(f"Etherscan gas oracle gagal: {message}")
+
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            raise BotError("Etherscan gas oracle response tidak valid.")
+
+        safe = decimal_from_payload(result, "SafeGasPrice")
+        standard = decimal_from_payload(result, "ProposeGasPrice")
+        fast = decimal_from_payload(result, "FastGasPrice")
+        if safe is None or standard is None or fast is None:
+            raise BotError("Etherscan gas oracle tidak mengembalikan data gwei lengkap.")
+
+        return GasEstimate(
+            safe_gwei=safe,
+            standard_gwei=standard,
+            fast_gwei=fast,
+            base_fee_gwei=decimal_from_payload(result, "suggestBaseFee"),
+            last_block=str(result.get("LastBlock")) if result.get("LastBlock") is not None else None,
+            gas_used_ratio=parse_latest_gas_used_ratio(result.get("gasUsedRatio")),
+            source="Etherscan Gas Oracle",
+        )
+
+    def get_rpc_gas(self) -> GasEstimate:
+        failures: list[str] = []
+        for rpc_url in self.rpc_urls:
+            try:
+                payload = generic_post_json(
+                    rpc_url,
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "eth_feeHistory",
+                        "params": ["0x5", "latest", [10, 50, 90]],
+                        "id": 1,
+                    },
+                )
+                estimate = parse_fee_history(payload, rpc_url)
+                return estimate
+            except BotError as exc:
+                failures.append(str(exc))
+
+        raise BotError("Semua public Ethereum RPC gagal: " + " | ".join(failures))
 
 
 class MarketStatsClient:
@@ -720,10 +830,12 @@ class TelegramBot:
         token: str,
         price_client: BinanceMarketClient,
         stats_client: MarketStatsClient,
+        gas_client: GasClient,
     ) -> None:
         self.token = token
         self.price_client = price_client
         self.stats_client = stats_client
+        self.gas_client = gas_client
         self.offset = load_offset()
 
     def run_forever(self) -> None:
@@ -781,6 +893,8 @@ class TelegramBot:
             return HELP_TEXT
         if lower in {"/timeframes", "timeframes", "/tf", "tf"}:
             return reply_timeframes()
+        if lower in {"/gas", "gas"}:
+            return self.reply_gas()
 
         request = parse_user_request(command)
         if request["kind"] == "price":
@@ -815,6 +929,9 @@ class TelegramBot:
     def reply_market_stats(self, coin: str) -> str:
         stats = self.stats_client.get_stats(coin)
         return format_market_stats(stats)
+
+    def reply_gas(self) -> str:
+        return format_gas_estimate(self.gas_client.get_gas())
 
     def reply_convert(self, amount: Decimal, coin: str, currency: str) -> str:
         target = currency.lower()
@@ -1043,6 +1160,101 @@ def format_percent_line(label: str, percent: Decimal | None, positive_icon: str)
     return f"{icon} {label}: {format_optional_percent(percent)}"
 
 
+def format_gas_estimate(estimate: GasEstimate) -> str:
+    lines = [
+        "⛽ Ethereum Gas",
+        f"🐢 Safe: {format_gwei(estimate.safe_gwei)} gwei",
+        f"⚖️ Standard: {format_gwei(estimate.standard_gwei)} gwei",
+        f"🚀 Fast: {format_gwei(estimate.fast_gwei)} gwei",
+    ]
+    if estimate.base_fee_gwei is not None:
+        lines.append(f"Base fee: {format_gwei(estimate.base_fee_gwei)} gwei")
+    if estimate.gas_used_ratio is not None:
+        lines.append(f"Network use: {format_decimal((estimate.gas_used_ratio * Decimal('100')).quantize(Decimal('0.01')))}%")
+    if estimate.last_block:
+        lines.append(f"Block: {estimate.last_block}")
+    lines.append(f"Source: {estimate.source}")
+    return "\n".join(lines)
+
+
+def parse_fee_history(payload: Any, source: str) -> GasEstimate:
+    if not isinstance(payload, dict):
+        raise BotError(f"{source} response tidak valid.")
+    if "error" in payload:
+        raise BotError(f"{source}: {payload['error']}")
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise BotError(f"{source} tidak mengembalikan fee history.")
+
+    base_fees = result.get("baseFeePerGas")
+    rewards = result.get("reward")
+    if not isinstance(base_fees, list) or not base_fees:
+        raise BotError(f"{source} tidak mengembalikan base fee.")
+    if not isinstance(rewards, list) or not rewards:
+        raise BotError(f"{source} tidak mengembalikan priority fee.")
+
+    base_fee_gwei = wei_hex_to_gwei(str(base_fees[-1]))
+    priority_columns = collect_priority_fee_columns(rewards)
+    if len(priority_columns) < 3:
+        raise BotError(f"{source} priority fee percentile tidak lengkap.")
+
+    safe_priority = average_decimal(priority_columns[0])
+    standard_priority = average_decimal(priority_columns[1])
+    fast_priority = average_decimal(priority_columns[2])
+    oldest_block = int(str(result.get("oldestBlock", "0x0")), 16)
+    last_block = oldest_block + len(rewards) - 1
+
+    return GasEstimate(
+        safe_gwei=base_fee_gwei + safe_priority,
+        standard_gwei=base_fee_gwei + standard_priority,
+        fast_gwei=base_fee_gwei + fast_priority,
+        base_fee_gwei=base_fee_gwei,
+        last_block=str(last_block) if last_block > 0 else None,
+        gas_used_ratio=parse_latest_gas_used_ratio(result.get("gasUsedRatio")),
+        source=f"Ethereum RPC eth_feeHistory ({source})",
+    )
+
+
+def collect_priority_fee_columns(rewards: list[Any]) -> list[list[Decimal]]:
+    columns: list[list[Decimal]] = []
+    for row in rewards:
+        if not isinstance(row, list):
+            continue
+        for index, value in enumerate(row):
+            while len(columns) <= index:
+                columns.append([])
+            columns[index].append(wei_hex_to_gwei(str(value)))
+    return columns
+
+
+def average_decimal(values: list[Decimal]) -> Decimal:
+    if not values:
+        return Decimal("0")
+    return sum(values, Decimal("0")) / Decimal(len(values))
+
+
+def wei_hex_to_gwei(value: str) -> Decimal:
+    return Decimal(int(value, 16)) / WEI_PER_GWEI
+
+
+def parse_latest_gas_used_ratio(value: Any) -> Decimal | None:
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        if not parts:
+            return None
+        value = parts[-1]
+    elif isinstance(value, list):
+        if not value:
+            return None
+        value = value[-1]
+
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def reply_timeframes() -> str:
     return "Timeframe Binance yang tersedia:\n" + ", ".join(BINANCE_TIMEFRAMES)
 
@@ -1052,6 +1264,47 @@ def strip_bot_mention(text: str) -> str:
     if "@" in first_word:
         first_word = first_word.split("@", 1)[0]
     return " ".join([first_word, *rest]).strip()
+
+
+def generic_get_json(url: str, params: dict[str, Any] | None = None) -> Any:
+    query = urllib.parse.urlencode(params or {})
+    full_url = f"{url}?{query}" if query else url
+    request = urllib.request.Request(
+        full_url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "crypto-telegram-converter/2.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        message = parse_error_message(body) or str(exc)
+        raise BotError(f"HTTP error ({exc.code}): {message}") from exc
+
+
+def generic_post_json(url: str, payload: dict[str, Any]) -> Any:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "crypto-telegram-converter/2.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        message = parse_error_message(body) or str(exc)
+        raise BotError(f"{url} HTTP error ({exc.code}): {message}") from exc
+    except urllib.error.URLError as exc:
+        raise BotError(f"{url} gagal diakses: {exc.reason}") from exc
 
 
 def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1139,11 +1392,15 @@ def parse_error_message(body: str) -> str | None:
 
 
 def parse_api_bases(raw_value: str | None) -> tuple[str, ...]:
-    if not raw_value:
-        return BINANCE_API_BASES
+    return parse_url_list(raw_value, BINANCE_API_BASES)
 
-    bases = tuple(base.strip() for base in raw_value.split(",") if base.strip())
-    return bases or BINANCE_API_BASES
+
+def parse_url_list(raw_value: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not raw_value:
+        return default
+
+    urls = tuple(value.strip() for value in raw_value.split(",") if value.strip())
+    return urls or default
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -1236,6 +1493,14 @@ def format_asset_amount(value: Decimal) -> str:
     return format_small_decimal(value)
 
 
+def format_gwei(value: Decimal) -> str:
+    if value >= Decimal("100"):
+        return format_decimal(value.quantize(Decimal("0.1")))
+    if value >= Decimal("1"):
+        return format_decimal(value.quantize(Decimal("0.01")))
+    return format_decimal(value.quantize(Decimal("0.001")))
+
+
 def format_quote_money(value: Decimal, quote_asset: str) -> str:
     if value >= Decimal("1"):
         return f"{quote_asset} {value.quantize(Decimal('0.01')):,.2f}"
@@ -1298,10 +1563,15 @@ def main() -> int:
 
     api_bases = parse_api_bases(os.environ.get("BINANCE_API_BASES") or os.environ.get("BINANCE_API_BASE"))
     coingecko_api_base = os.environ.get("COINGECKO_API_BASE", COINGECKO_API_BASE)
+    eth_rpc_urls = parse_url_list(os.environ.get("ETH_RPC_URLS"), ETH_RPC_URLS)
     bot = TelegramBot(
         token=token,
         price_client=BinanceMarketClient(api_bases=api_bases),
         stats_client=MarketStatsClient(api_base=coingecko_api_base),
+        gas_client=GasClient(
+            etherscan_api_key=os.environ.get("ETHERSCAN_API_KEY"),
+            rpc_urls=eth_rpc_urls,
+        ),
     )
     bot.run_forever()
     return 0
