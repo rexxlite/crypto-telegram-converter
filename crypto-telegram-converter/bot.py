@@ -57,6 +57,8 @@ GAS_CACHE_SECONDS = 15
 CHART_CANDLE_LIMIT = 134
 WEI_PER_GWEI = Decimal("1000000000")
 TOKEN_MARKS_PATH = os.path.join(BASE_DIR, ".token_marks.json")
+TOKEN_REFRESH_COOLDOWN_SECONDS = 5
+TOKEN_CALLBACK_PREFIX = "tok"
 
 SUPPORTED_TOKEN_CHAINS = {
     "ethereum": {"tag": "ETH", "goplus_chain_id": "1"},
@@ -247,6 +249,7 @@ class PhotoReply:
 class TextReply:
     text: str
     parse_mode: str | None = None
+    reply_markup: dict[str, Any] | None = None
 
 
 @dataclass
@@ -393,11 +396,15 @@ class TokenLookupClient:
         self.dexscreener_api_base = dexscreener_api_base.rstrip("/")
         self.goplus_api_base = goplus_api_base.rstrip("/")
 
-    def get_token_snapshot(self, address: str) -> TokenSnapshot:
+    def get_token_snapshot(self, address: str, chain_id: str | None = None) -> TokenSnapshot:
         normalized = normalize_contract_address(address)
+        if chain_id is not None and chain_id not in SUPPORTED_TOKEN_CHAINS:
+            raise BotError("Chain token tidak didukung.")
+
         pairs: list[dict[str, Any]] = []
-        for chain_id in SUPPORTED_TOKEN_CHAINS:
-            endpoint = f"{self.dexscreener_api_base}/tokens/v1/{chain_id}/{normalized}"
+        chain_ids = (chain_id,) if chain_id else tuple(SUPPORTED_TOKEN_CHAINS)
+        for current_chain_id in chain_ids:
+            endpoint = f"{self.dexscreener_api_base}/tokens/v1/{current_chain_id}/{normalized}"
             try:
                 payload = generic_get_json(endpoint)
             except BotError:
@@ -1152,6 +1159,7 @@ class TelegramBot:
         self.token_client = token_client
         self.mark_store = mark_store
         self.offset = load_offset()
+        self.token_refresh_times: dict[tuple[int, int], float] = {}
 
     def run_forever(self) -> None:
         print("Bot aktif. Tekan Ctrl+C untuk berhenti.")
@@ -1176,12 +1184,16 @@ class TelegramBot:
         payload = {
             "timeout": POLL_TIMEOUT_SECONDS,
             "offset": self.offset,
-            "allowed_updates": json.dumps(["message"]),
+            "allowed_updates": json.dumps(["message", "callback_query"]),
         }
         response = self.telegram_request("getUpdates", payload)
         return response.get("result", [])
 
     def handle_update(self, update: dict[str, Any]) -> None:
+        if "callback_query" in update:
+            self.handle_callback_query(update["callback_query"])
+            return
+
         message = update.get("message") or {}
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
@@ -1200,9 +1212,83 @@ class TelegramBot:
         if isinstance(reply, PhotoReply):
             self.send_photo(chat_id, reply.photo, reply.caption, reply.filename)
         elif isinstance(reply, TextReply):
-            self.send_message(chat_id, reply.text, parse_mode=reply.parse_mode)
+            self.send_message(chat_id, reply.text, parse_mode=reply.parse_mode, reply_markup=reply.reply_markup)
         else:
             self.send_message(chat_id, reply)
+
+    def handle_callback_query(self, callback_query: dict[str, Any]) -> None:
+        callback_id = str(callback_query.get("id") or "")
+        try:
+            callback = parse_token_callback_data(str(callback_query.get("data") or ""))
+            message = callback_query.get("message") if isinstance(callback_query.get("message"), dict) else {}
+            chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+            chat_id = chat.get("id")
+            message_id = message.get("message_id")
+            if chat_id is None or message_id is None:
+                raise BotError("Pesan token tidak ditemukan.")
+
+            if callback["action"] == "d":
+                self.delete_message(chat_id, message_id)
+                self.token_refresh_times.pop((int(chat_id), int(message_id)), None)
+                self.answer_callback_query(callback_id, "Dihapus.")
+                return
+
+            if callback["action"] == "r":
+                self.refresh_token_message(callback_query, callback, int(chat_id), int(message_id), message)
+                return
+
+            raise BotError("Action tombol tidak dikenal.")
+        except BotError as exc:
+            if callback_id:
+                self.answer_callback_query(callback_id, str(exc), show_alert=True)
+
+    def refresh_token_message(
+        self,
+        callback_query: dict[str, Any],
+        callback: dict[str, str],
+        chat_id: int,
+        message_id: int,
+        message: dict[str, Any],
+    ) -> None:
+        callback_id = str(callback_query.get("id") or "")
+        now = time.time()
+        refresh_key = (chat_id, message_id)
+        last_refresh = self.token_refresh_times.get(refresh_key)
+        if last_refresh is None:
+            last_refresh = float(message.get("edit_date") or message.get("date") or 0)
+
+        remaining = TOKEN_REFRESH_COOLDOWN_SECONDS - (now - last_refresh)
+        if remaining > 0:
+            wait_seconds = int(remaining) + 1
+            self.answer_callback_query(callback_id, f"Tunggu {wait_seconds} detik sebelum refresh.")
+            return
+
+        snapshot = self.token_client.get_token_snapshot(callback["address"], chain_id=callback["chain_id"])
+        mark = self.mark_store.get_or_create(
+            chat_id=chat_id,
+            chain_id=snapshot.chain_id,
+            address=snapshot.address,
+            user_label=format_callback_user(callback_query),
+            market_cap=snapshot.market_cap or snapshot.fdv,
+        )
+        reply = build_token_text_reply(snapshot, mark)
+        try:
+            self.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=reply.text,
+                parse_mode=reply.parse_mode,
+                reply_markup=reply.reply_markup,
+            )
+        except BotError as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+            self.token_refresh_times[refresh_key] = now
+            self.answer_callback_query(callback_id, "Data masih sama.")
+            return
+
+        self.token_refresh_times[refresh_key] = now
+        self.answer_callback_query(callback_id, "Data diperbarui.")
 
     def build_reply(self, text: str, chat_id: int | None = None, user_label: str = "unknown") -> str | PhotoReply | TextReply:
         command = strip_bot_mention(text)
@@ -1326,9 +1412,15 @@ class TelegramBot:
             user_label=user_label,
             market_cap=snapshot.market_cap or snapshot.fdv,
         )
-        return TextReply(format_token_snapshot(snapshot, mark), parse_mode="HTML")
+        return build_token_text_reply(snapshot, mark)
 
-    def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> None:
+    def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
@@ -1336,10 +1428,46 @@ class TelegramBot:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup)
         self.telegram_request(
             "sendMessage",
             payload,
         )
+
+    def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        parse_mode: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        self.telegram_request("editMessageText", payload)
+
+    def delete_message(self, chat_id: int, message_id: int) -> None:
+        self.telegram_request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+    def answer_callback_query(self, callback_query_id: str, text: str | None = None, show_alert: bool = False) -> None:
+        if not callback_query_id:
+            return
+        payload: dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": "true" if show_alert else "false",
+        }
+        if text:
+            payload["text"] = text[:200]
+        self.telegram_request("answerCallbackQuery", payload)
 
     def send_photo(self, chat_id: int, photo: bytes, caption: str, filename: str) -> None:
         self.telegram_upload(
@@ -1469,6 +1597,24 @@ def parse_user_request(text: str) -> dict[str, Any]:
     raise BotError("Format belum dikenali.")
 
 
+def parse_token_callback_data(data: str) -> dict[str, str]:
+    parts = data.split("|")
+    if len(parts) != 4 or parts[0] != TOKEN_CALLBACK_PREFIX:
+        raise BotError("Tombol ini tidak valid.")
+
+    action, chain_id, address = parts[1], parts[2], parts[3]
+    if action not in {"d", "r"}:
+        raise BotError("Action tombol tidak valid.")
+    if chain_id not in SUPPORTED_TOKEN_CHAINS:
+        raise BotError("Chain token tidak didukung.")
+
+    return {
+        "action": action,
+        "chain_id": chain_id,
+        "address": normalize_contract_address(address),
+    }
+
+
 def normalize_currency(currency: str | None) -> str:
     if not currency:
         raise BotError("Target mata uang belum diisi. Pilih USD, USDT, atau IDR.")
@@ -1532,6 +1678,15 @@ def is_supported_token_pair(pair: dict[str, Any], address: str) -> bool:
 
 def format_message_user(message: dict[str, Any]) -> str:
     user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    return format_user_label(user)
+
+
+def format_callback_user(callback_query: dict[str, Any]) -> str:
+    user = callback_query.get("from") if isinstance(callback_query.get("from"), dict) else {}
+    return format_user_label(user)
+
+
+def format_user_label(user: dict[str, Any]) -> str:
     username = user.get("username")
     if username:
         return f"@{username}"
@@ -1683,6 +1838,29 @@ def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
             ]
         )
     return "\n".join(lines)
+
+
+def build_token_text_reply(snapshot: TokenSnapshot, mark: TokenMark) -> TextReply:
+    return TextReply(
+        text=format_token_snapshot(snapshot, mark),
+        parse_mode="HTML",
+        reply_markup=build_token_reply_markup(snapshot),
+    )
+
+
+def build_token_reply_markup(snapshot: TokenSnapshot) -> dict[str, Any]:
+    open_url = snapshot.pair_url or explorer_token_url(snapshot)
+    buttons = [
+        {"text": "🗑", "callback_data": token_callback_data("d", snapshot)},
+        {"text": "↻", "callback_data": token_callback_data("r", snapshot)},
+    ]
+    if open_url:
+        buttons.append({"text": "💎 ↗", "url": open_url})
+    return {"inline_keyboard": [buttons]}
+
+
+def token_callback_data(action: str, snapshot: TokenSnapshot) -> str:
+    return f"{TOKEN_CALLBACK_PREFIX}|{action}|{snapshot.chain_id}|{snapshot.address.lower()}"
 
 
 def format_token_snapshot(snapshot: TokenSnapshot, mark: TokenMark) -> str:
