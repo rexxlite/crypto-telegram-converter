@@ -251,6 +251,9 @@ class TextReply:
     text: str
     parse_mode: str | None = None
     reply_markup: dict[str, Any] | None = None
+    token_snapshot: TokenSnapshot | None = None
+    token_mark: TokenMark | None = None
+    token_ref: TokenMessageRef | None = None
 
 
 @dataclass
@@ -290,6 +293,17 @@ class TokenSecurity:
     sell_tax: Decimal | None = None
     is_honeypot: str | None = None
     is_open_source: str | None = None
+    is_proxy: str | None = None
+    is_mintable: str | None = None
+    hidden_owner: str | None = None
+    can_take_back_ownership: str | None = None
+    selfdestruct: str | None = None
+    cannot_buy: str | None = None
+    cannot_sell_all: str | None = None
+    trading_cooldown: str | None = None
+    is_blacklisted: str | None = None
+    is_whitelisted: str | None = None
+    is_in_dex: str | None = None
     top_10_holder_rate: Decimal | None = None
     holder_count: str | None = None
     lp_holder_count: str | None = None
@@ -334,6 +348,16 @@ class TokenMark:
     first_seen: int
     first_market_cap: Decimal | None
     is_new: bool
+    first_message_id: int | None = None
+    first_chat_id: int | None = None
+    first_chat_username: str | None = None
+
+
+@dataclass
+class TokenMessageRef:
+    chat_id: int
+    chain_id: str
+    address: str
 
 
 class TokenMarkStore:
@@ -371,6 +395,9 @@ class TokenMarkStore:
                 first_seen=int(existing.get("first_seen") or int(time.time())),
                 first_market_cap=decimal_from_any(existing.get("first_market_cap")),
                 is_new=False,
+                first_message_id=int_or_none(existing.get("first_message_id")),
+                first_chat_id=int_or_none(existing.get("first_chat_id")) or chat_id,
+                first_chat_username=str(existing.get("first_chat_username")) if existing.get("first_chat_username") else None,
             )
 
         now = int(time.time())
@@ -378,6 +405,9 @@ class TokenMarkStore:
             "first_user": user_label,
             "first_seen": now,
             "first_market_cap": str(market_cap) if market_cap is not None else None,
+            "first_chat_id": chat_id,
+            "first_message_id": None,
+            "first_chat_username": None,
         }
         self.save()
         return TokenMark(
@@ -385,6 +415,37 @@ class TokenMarkStore:
             first_seen=now,
             first_market_cap=market_cap,
             is_new=True,
+            first_chat_id=chat_id,
+        )
+
+    def attach_first_message(
+        self,
+        chat_id: int,
+        chain_id: str,
+        address: str,
+        message_id: int,
+        chat_username: str | None,
+        is_new: bool,
+    ) -> TokenMark | None:
+        key = f"{chat_id}:{chain_id}:{address.lower()}"
+        existing = self._data.get(key)
+        if not isinstance(existing, dict):
+            return None
+        if existing.get("first_message_id"):
+            return None
+
+        existing["first_chat_id"] = chat_id
+        existing["first_message_id"] = message_id
+        existing["first_chat_username"] = chat_username
+        self.save()
+        return TokenMark(
+            first_user=str(existing.get("first_user") or "unknown"),
+            first_seen=int(existing.get("first_seen") or int(time.time())),
+            first_market_cap=decimal_from_any(existing.get("first_market_cap")),
+            is_new=is_new,
+            first_message_id=message_id,
+            first_chat_id=chat_id,
+            first_chat_username=chat_username,
         )
 
 
@@ -486,6 +547,17 @@ class TokenLookupClient:
             sell_tax=percent_decimal_from_ratio(token_data.get("sell_tax")),
             is_honeypot=value_to_yes_no(token_data.get("is_honeypot")),
             is_open_source=value_to_yes_no(token_data.get("is_open_source")),
+            is_proxy=value_to_yes_no(token_data.get("is_proxy")),
+            is_mintable=value_to_yes_no(token_data.get("is_mintable")),
+            hidden_owner=value_to_yes_no(token_data.get("hidden_owner")),
+            can_take_back_ownership=value_to_yes_no(token_data.get("can_take_back_ownership")),
+            selfdestruct=value_to_yes_no(token_data.get("selfdestruct")),
+            cannot_buy=value_to_yes_no(token_data.get("cannot_buy")),
+            cannot_sell_all=value_to_yes_no(token_data.get("cannot_sell_all")),
+            trading_cooldown=value_to_yes_no(token_data.get("trading_cooldown")),
+            is_blacklisted=value_to_yes_no(token_data.get("is_blacklisted")),
+            is_whitelisted=value_to_yes_no(token_data.get("is_whitelisted")),
+            is_in_dex=value_to_yes_no(token_data.get("is_in_dex")),
             top_10_holder_rate=percent_decimal_from_ratio(token_data.get("top_10_holder_rate")),
             holder_count=str(token_data.get("holder_count")) if token_data.get("holder_count") is not None else None,
             lp_holder_count=str(token_data.get("lp_holder_count")) if token_data.get("lp_holder_count") is not None else None,
@@ -1213,9 +1285,47 @@ class TelegramBot:
         if isinstance(reply, PhotoReply):
             self.send_photo(chat_id, reply.photo, reply.caption, reply.filename)
         elif isinstance(reply, TextReply):
-            self.send_message(chat_id, reply.text, parse_mode=reply.parse_mode, reply_markup=reply.reply_markup)
+            response = self.send_message(chat_id, reply.text, parse_mode=reply.parse_mode, reply_markup=reply.reply_markup)
+            self.attach_token_first_message(reply, response, chat)
         else:
             self.send_message(chat_id, reply)
+
+    def attach_token_first_message(
+        self,
+        reply: TextReply,
+        response: dict[str, Any],
+        chat: dict[str, Any],
+    ) -> None:
+        if not reply.token_ref or not reply.token_snapshot or not reply.token_mark:
+            return
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        message_id = int_or_none(result.get("message_id"))
+        if message_id is None:
+            return
+
+        updated_mark = self.mark_store.attach_first_message(
+            chat_id=reply.token_ref.chat_id,
+            chain_id=reply.token_ref.chain_id,
+            address=reply.token_ref.address,
+            message_id=message_id,
+            chat_username=str(chat.get("username")) if chat.get("username") else None,
+            is_new=reply.token_mark.is_new,
+        )
+        if updated_mark is None:
+            return
+
+        updated_reply = build_token_text_reply(reply.token_snapshot, updated_mark)
+        try:
+            self.edit_message_text(
+                chat_id=reply.token_ref.chat_id,
+                message_id=message_id,
+                text=updated_reply.text,
+                parse_mode=updated_reply.parse_mode,
+                reply_markup=updated_reply.reply_markup,
+            )
+        except BotError as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
 
     def handle_callback_query(self, callback_query: dict[str, Any]) -> None:
         callback_id = str(callback_query.get("id") or "")
@@ -1413,7 +1523,11 @@ class TelegramBot:
             user_label=user_label,
             market_cap=snapshot.market_cap or snapshot.fdv,
         )
-        return build_token_text_reply(snapshot, mark)
+        return build_token_text_reply(
+            snapshot,
+            mark,
+            token_ref=TokenMessageRef(chat_id=chat_id, chain_id=snapshot.chain_id, address=snapshot.address),
+        )
 
     def send_message(
         self,
@@ -1421,7 +1535,7 @@ class TelegramBot:
         text: str,
         parse_mode: str | None = None,
         reply_markup: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "text": text,
@@ -1431,7 +1545,7 @@ class TelegramBot:
             payload["parse_mode"] = parse_mode
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup)
-        self.telegram_request(
+        return self.telegram_request(
             "sendMessage",
             payload,
         )
@@ -1841,11 +1955,18 @@ def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
     return "\n".join(lines)
 
 
-def build_token_text_reply(snapshot: TokenSnapshot, mark: TokenMark) -> TextReply:
+def build_token_text_reply(
+    snapshot: TokenSnapshot,
+    mark: TokenMark,
+    token_ref: TokenMessageRef | None = None,
+) -> TextReply:
     return TextReply(
         text=format_token_snapshot(snapshot, mark),
         parse_mode="HTML",
         reply_markup=build_token_reply_markup(snapshot),
+        token_snapshot=snapshot,
+        token_mark=mark,
+        token_ref=token_ref,
     )
 
 
@@ -1914,16 +2035,40 @@ def format_security_lines(security: TokenSecurity | None) -> list[str]:
         return ["└ Security data unavailable"]
     return [
         format_token_data_line("├", "Tax", f"{format_security_percent(security.buy_tax)} buy / {format_security_percent(security.sell_tax)} sell"),
-        format_token_data_line("├", "Honey", security.is_honeypot or "N/A"),
-        format_token_data_line("├", "Source", security.is_open_source or "N/A"),
+        format_token_data_line(
+            "├",
+            "Audit",
+            f"Open {security.is_open_source or 'N/A'} | Proxy {security.is_proxy or 'N/A'} | Mint {security.is_mintable or 'N/A'}",
+        ),
+        format_token_data_line(
+            "├",
+            "Owner",
+            f"Hidden {security.hidden_owner or 'N/A'} | TakeBack {security.can_take_back_ownership or 'N/A'}",
+        ),
+        format_token_data_line(
+            "├",
+            "Trade",
+            (
+                f"Honey {security.is_honeypot or 'N/A'} | "
+                f"NoBuy {security.cannot_buy or 'N/A'} | "
+                f"NoSell {security.cannot_sell_all or 'N/A'}"
+            ),
+        ),
+        format_token_data_line(
+            "├",
+            "List",
+            f"Black {security.is_blacklisted or 'N/A'} | White {security.is_whitelisted or 'N/A'}",
+        ),
         format_token_data_line("├", "Top10", format_security_percent(security.top_10_holder_rate)),
-        format_token_data_line("└", "Holders", f"{security.holder_count or 'N/A'} | LP {security.lp_holder_count or 'N/A'}"),
+        format_token_data_line("└", "DEX", f"In {security.is_in_dex or 'N/A'} | Holders {security.holder_count or 'N/A'} | LP {security.lp_holder_count or 'N/A'}"),
     ]
 
 
 def format_contract_mark_html(mark: TokenMark, current_market_cap: Decimal | None) -> str:
     first_mcap = mark.first_market_cap
     elapsed = format_elapsed_seconds(int(time.time()) - mark.first_seen)
+    elapsed_url = first_scan_message_url(mark)
+    elapsed_html = format_html_link(elapsed, elapsed_url) if elapsed_url else html_escape(elapsed)
     icon = "🆕" if mark.is_new else "😈"
     if first_mcap and first_mcap > 0 and current_market_cap is not None:
         change = ((current_market_cap - first_mcap) / first_mcap) * Decimal("100")
@@ -1933,8 +2078,21 @@ def format_contract_mark_html(mark: TokenMark, current_market_cap: Decimal | Non
     return (
         f"{icon} <b>{html_escape(mark.first_user)}</b> @ "
         f"<b>{html_escape(format_optional_compact_usd(first_mcap))}</b> "
-        f"<b>[{html_escape(change_text)}]</b> ({html_escape(elapsed)})"
+        f"<b>[{html_escape(change_text)}]</b> ({elapsed_html})"
     )
+
+
+def first_scan_message_url(mark: TokenMark) -> str | None:
+    if mark.first_message_id is None:
+        return None
+    if mark.first_chat_username:
+        return f"https://t.me/{mark.first_chat_username}/{mark.first_message_id}"
+    if mark.first_chat_id is None:
+        return None
+    chat_id_text = str(mark.first_chat_id)
+    if chat_id_text.startswith("-100"):
+        return f"https://t.me/c/{chat_id_text[4:]}/{mark.first_message_id}"
+    return None
 
 
 def format_token_data_line(prefix: str, label: str, value: str, extra_html: str = "") -> str:

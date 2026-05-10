@@ -74,6 +74,7 @@ python3 bot.py
 - Command `/gas` memakai Etherscan Gas Oracle jika `ETHERSCAN_API_KEY` diisi, lalu fallback ke public Ethereum RPC `eth_feeHistory`.
 - Contract address lookup memakai DexScreener untuk data token/pair dan GoPlus Labs untuk data security best-effort.
 - Mark contract pertama per grup disimpan lokal di `.token_marks.json`, berisi user pertama yang paste, waktu pertama, dan market cap pertama.
+- Waktu mark token seperti `(1h)` menjadi link ke pesan scan pertama jika message id pertama sudah terekam.
 - Tombol refresh info token hanya bisa dipakai setiap 5 detik per pesan agar API tidak kena spam.
 - Bot mencoba beberapa endpoint Binance secara berurutan, termasuk `data-api.binance.vision` untuk market data.
 - Chart dibuat lokal di VPS dengan `matplotlib`, lalu dikirim ke Telegram sebagai foto.
