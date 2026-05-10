@@ -59,11 +59,12 @@ WEI_PER_GWEI = Decimal("1000000000")
 TOKEN_MARKS_PATH = os.path.join(BASE_DIR, ".token_marks.json")
 TOKEN_REFRESH_COOLDOWN_SECONDS = 5
 TOKEN_CALLBACK_PREFIX = "tok"
+GMGN_REFERRAL_ID = "30I510nA"
 
 SUPPORTED_TOKEN_CHAINS = {
-    "ethereum": {"tag": "ETH", "goplus_chain_id": "1"},
-    "base": {"tag": "BASE", "goplus_chain_id": "8453"},
-    "bsc": {"tag": "BNB", "goplus_chain_id": "56"},
+    "ethereum": {"tag": "ETH", "goplus_chain_id": "1", "gmgn_chain": "eth", "okx_chain": "ethereum"},
+    "base": {"tag": "BASE", "goplus_chain_id": "8453", "gmgn_chain": "base", "okx_chain": "base"},
+    "bsc": {"tag": "BNB", "goplus_chain_id": "56", "gmgn_chain": "bsc", "okx_chain": "bsc"},
 }
 
 BINANCE_TIMEFRAMES = (
@@ -1901,6 +1902,8 @@ def format_token_snapshot(snapshot: TokenSnapshot, mark: TokenMark) -> str:
         "🔒 <b>Security</b>",
         *format_security_lines(snapshot.security),
         "",
+        format_token_tools_links_html(snapshot),
+        "",
         format_contract_mark_html(mark, market_cap),
     ]
     return "\n".join(lines)
@@ -1946,8 +1949,6 @@ def format_social_links_html(snapshot: TokenSnapshot, explorer_url: str | None) 
     links: list[TokenLink] = []
     links.extend(snapshot.socials)
     links.extend(TokenLink(label=normalize_website_label(link.label), url=link.url) for link in snapshot.websites)
-    if snapshot.pair_url:
-        links.append(TokenLink(label="DEX", url=snapshot.pair_url))
     if explorer_url:
         links.append(TokenLink(label="Scan", url=explorer_url))
 
@@ -1955,6 +1956,16 @@ def format_social_links_html(snapshot: TokenSnapshot, explorer_url: str | None) 
     if not unique_links:
         return "N/A"
     return " · ".join(format_html_link(link.label, link.url) for link in unique_links)
+
+
+def format_token_tools_links_html(snapshot: TokenSnapshot) -> str:
+    links = [
+        TokenLink(label="gmgn", url=gmgn_token_url(snapshot)),
+        TokenLink(label="okx", url=okx_web3_token_url(snapshot)),
+    ]
+    if snapshot.pair_url:
+        links.append(TokenLink(label="dex", url=snapshot.pair_url))
+    return " · ".join(format_html_link(link.label, link.url) for link in links)
 
 
 def dedupe_token_links(links: list[TokenLink]) -> list[TokenLink]:
@@ -1978,6 +1989,18 @@ def normalize_website_label(label: str) -> str:
 
 def format_html_link(label: str, url: str) -> str:
     return f'<a href="{html_escape(url, quote=True)}">{html_escape(label)}</a>'
+
+
+def gmgn_token_url(snapshot: TokenSnapshot) -> str:
+    config = SUPPORTED_TOKEN_CHAINS.get(snapshot.chain_id, {})
+    chain = str(config.get("gmgn_chain") or snapshot.chain_id)
+    return f"https://gmgn.ai/{chain}/token/{GMGN_REFERRAL_ID}_{snapshot.address}"
+
+
+def okx_web3_token_url(snapshot: TokenSnapshot) -> str:
+    config = SUPPORTED_TOKEN_CHAINS.get(snapshot.chain_id, {})
+    chain = str(config.get("okx_chain") or snapshot.chain_id)
+    return f"https://web3.okx.com/explorer/{chain}/token/{snapshot.address}"
 
 
 def explorer_token_url(snapshot: TokenSnapshot) -> str | None:
