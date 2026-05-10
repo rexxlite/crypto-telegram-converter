@@ -29,6 +29,8 @@ TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 BINANCE_API_BASE = "https://api.binance.com"
 COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api"
+DEXSCREENER_API_BASE = "https://api.dexscreener.com"
+GOPLUS_API_BASE = "https://api.gopluslabs.io/api/v1"
 ETH_RPC_URLS = (
     "https://ethereum.publicnode.com",
     "https://rpc.flashbots.net",
@@ -53,6 +55,13 @@ MARKET_STATS_CACHE_SECONDS = 30
 GAS_CACHE_SECONDS = 15
 CHART_CANDLE_LIMIT = 134
 WEI_PER_GWEI = Decimal("1000000000")
+TOKEN_MARKS_PATH = os.path.join(BASE_DIR, ".token_marks.json")
+
+SUPPORTED_TOKEN_CHAINS = {
+    "ethereum": {"tag": "ETH", "goplus_chain_id": "1"},
+    "base": {"tag": "BASE", "goplus_chain_id": "8453"},
+    "bsc": {"tag": "BNB", "goplus_chain_id": "56"},
+}
 
 BINANCE_TIMEFRAMES = (
     "1s",
@@ -147,9 +156,11 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /p btc
 /mp btc sol eth
 /gas
+/ca 0xcontract
 /convert 0.5 btc usd
 /convert 250 doge idr
 0.1 btc
+0xcontract
 /tv eth
 /tv eth 15m
 /kline btc 15m
@@ -260,6 +271,204 @@ class GasEstimate:
     last_block: str | None
     gas_used_ratio: Decimal | None
     source: str
+
+
+@dataclass
+class TokenSecurity:
+    buy_tax: Decimal | None = None
+    sell_tax: Decimal | None = None
+    is_honeypot: str | None = None
+    is_open_source: str | None = None
+    top_10_holder_rate: Decimal | None = None
+    holder_count: str | None = None
+    lp_holder_count: str | None = None
+
+
+@dataclass
+class TokenSnapshot:
+    chain_id: str
+    chain_tag: str
+    address: str
+    name: str
+    symbol: str
+    dex_id: str
+    pair_address: str
+    pair_url: str | None
+    price_usd: Decimal | None
+    market_cap: Decimal | None
+    fdv: Decimal | None
+    volume_24h: Decimal | None
+    liquidity_usd: Decimal | None
+    change_h1: Decimal | None
+    change_h24: Decimal | None
+    buys_h1: int | None
+    sells_h1: int | None
+    buys_h24: int | None
+    sells_h24: int | None
+    pair_created_at_ms: int | None
+    websites: list[str]
+    socials: list[str]
+    security: TokenSecurity | None
+
+
+@dataclass
+class TokenMark:
+    first_user: str
+    first_seen: int
+    first_market_cap: Decimal | None
+    is_new: bool
+
+
+class TokenMarkStore:
+    def __init__(self, path: str = TOKEN_MARKS_PATH) -> None:
+        self.path = path
+        self._data = self.load()
+
+    def load(self) -> dict[str, Any]:
+        if not os.path.exists(self.path):
+            return {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as marks_file:
+                data = json.load(marks_file)
+                return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def save(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as marks_file:
+            json.dump(self._data, marks_file, ensure_ascii=False, indent=2, sort_keys=True)
+
+    def get_or_create(
+        self,
+        chat_id: int,
+        chain_id: str,
+        address: str,
+        user_label: str,
+        market_cap: Decimal | None,
+    ) -> TokenMark:
+        key = f"{chat_id}:{chain_id}:{address.lower()}"
+        existing = self._data.get(key)
+        if isinstance(existing, dict):
+            return TokenMark(
+                first_user=str(existing.get("first_user") or "unknown"),
+                first_seen=int(existing.get("first_seen") or int(time.time())),
+                first_market_cap=decimal_from_any(existing.get("first_market_cap")),
+                is_new=False,
+            )
+
+        now = int(time.time())
+        self._data[key] = {
+            "first_user": user_label,
+            "first_seen": now,
+            "first_market_cap": str(market_cap) if market_cap is not None else None,
+        }
+        self.save()
+        return TokenMark(
+            first_user=user_label,
+            first_seen=now,
+            first_market_cap=market_cap,
+            is_new=True,
+        )
+
+
+class TokenLookupClient:
+    def __init__(
+        self,
+        dexscreener_api_base: str = DEXSCREENER_API_BASE,
+        goplus_api_base: str = GOPLUS_API_BASE,
+    ) -> None:
+        self.dexscreener_api_base = dexscreener_api_base.rstrip("/")
+        self.goplus_api_base = goplus_api_base.rstrip("/")
+
+    def get_token_snapshot(self, address: str) -> TokenSnapshot:
+        normalized = normalize_contract_address(address)
+        pairs: list[dict[str, Any]] = []
+        for chain_id in SUPPORTED_TOKEN_CHAINS:
+            endpoint = f"{self.dexscreener_api_base}/tokens/v1/{chain_id}/{normalized}"
+            try:
+                payload = generic_get_json(endpoint)
+            except BotError:
+                continue
+            if isinstance(payload, list):
+                pairs.extend(pair for pair in payload if isinstance(pair, dict))
+
+        candidates = [pair for pair in pairs if is_supported_token_pair(pair, normalized)]
+        if not candidates:
+            raise BotError("Contract address tidak ditemukan di DexScreener untuk ETH/Base/BNB.")
+
+        best_pair = max(candidates, key=lambda pair: decimal_from_path(pair, ("liquidity", "usd")) or Decimal("0"))
+        snapshot = self.build_snapshot(best_pair, normalized)
+        snapshot.security = self.get_security(snapshot.chain_id, normalized)
+        return snapshot
+
+    def build_snapshot(self, pair: dict[str, Any], address: str) -> TokenSnapshot:
+        chain_id = str(pair.get("chainId") or "")
+        config = SUPPORTED_TOKEN_CHAINS.get(chain_id)
+        if not config:
+            raise BotError("Chain token tidak didukung.")
+
+        base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+        info = pair.get("info") if isinstance(pair.get("info"), dict) else {}
+        websites = extract_websites(info)
+        socials = extract_socials(info)
+        txns_h1 = pair.get("txns", {}).get("h1", {}) if isinstance(pair.get("txns"), dict) else {}
+        txns_h24 = pair.get("txns", {}).get("h24", {}) if isinstance(pair.get("txns"), dict) else {}
+
+        return TokenSnapshot(
+            chain_id=chain_id,
+            chain_tag=str(config["tag"]),
+            address=address,
+            name=str(base_token.get("name") or "Unknown"),
+            symbol=str(base_token.get("symbol") or "???"),
+            dex_id=str(pair.get("dexId") or "dex"),
+            pair_address=str(pair.get("pairAddress") or ""),
+            pair_url=pair.get("url") if isinstance(pair.get("url"), str) else None,
+            price_usd=decimal_from_any(pair.get("priceUsd")),
+            market_cap=decimal_from_any(pair.get("marketCap")),
+            fdv=decimal_from_any(pair.get("fdv")),
+            volume_24h=decimal_from_path(pair, ("volume", "h24")),
+            liquidity_usd=decimal_from_path(pair, ("liquidity", "usd")),
+            change_h1=decimal_from_path(pair, ("priceChange", "h1")),
+            change_h24=decimal_from_path(pair, ("priceChange", "h24")),
+            buys_h1=int_or_none(txns_h1.get("buys")),
+            sells_h1=int_or_none(txns_h1.get("sells")),
+            buys_h24=int_or_none(txns_h24.get("buys")),
+            sells_h24=int_or_none(txns_h24.get("sells")),
+            pair_created_at_ms=int_or_none(pair.get("pairCreatedAt")),
+            websites=websites,
+            socials=socials,
+            security=None,
+        )
+
+    def get_security(self, chain_id: str, address: str) -> TokenSecurity | None:
+        config = SUPPORTED_TOKEN_CHAINS.get(chain_id)
+        if not config:
+            return None
+
+        endpoint = f"{self.goplus_api_base}/token_security/{config['goplus_chain_id']}"
+        try:
+            payload = generic_get_json(endpoint, {"contract_addresses": address})
+        except BotError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            return None
+        token_data = result.get(address.lower()) or result.get(address) or next(iter(result.values()), None)
+        if not isinstance(token_data, dict):
+            return None
+
+        return TokenSecurity(
+            buy_tax=percent_decimal_from_ratio(token_data.get("buy_tax")),
+            sell_tax=percent_decimal_from_ratio(token_data.get("sell_tax")),
+            is_honeypot=value_to_yes_no(token_data.get("is_honeypot")),
+            is_open_source=value_to_yes_no(token_data.get("is_open_source")),
+            top_10_holder_rate=percent_decimal_from_ratio(token_data.get("top_10_holder_rate")),
+            holder_count=str(token_data.get("holder_count")) if token_data.get("holder_count") is not None else None,
+            lp_holder_count=str(token_data.get("lp_holder_count")) if token_data.get("lp_holder_count") is not None else None,
+        )
 
 
 class GasClient:
@@ -920,11 +1129,15 @@ class TelegramBot:
         price_client: BinanceMarketClient,
         stats_client: MarketStatsClient,
         gas_client: GasClient,
+        token_client: TokenLookupClient,
+        mark_store: TokenMarkStore,
     ) -> None:
         self.token = token
         self.price_client = price_client
         self.stats_client = stats_client
         self.gas_client = gas_client
+        self.token_client = token_client
+        self.mark_store = mark_store
         self.offset = load_offset()
 
     def run_forever(self) -> None:
@@ -963,11 +1176,11 @@ class TelegramBot:
 
         if chat_id is None or not text:
             return
-        if not text.startswith("/") and not is_quick_convert_amount_coin(text):
+        if not text.startswith("/") and not is_quick_convert_amount_coin(text) and not extract_contract_address(text):
             return
 
         try:
-            reply = self.build_reply(text)
+            reply = self.build_reply(text, chat_id=chat_id, user_label=format_message_user(message))
         except BotError as exc:
             reply = f"{exc}\n\nKetik /help untuk contoh command."
 
@@ -976,7 +1189,7 @@ class TelegramBot:
         else:
             self.send_message(chat_id, reply)
 
-    def build_reply(self, text: str) -> str | PhotoReply:
+    def build_reply(self, text: str, chat_id: int | None = None, user_label: str = "unknown") -> str | PhotoReply:
         command = strip_bot_mention(text)
         lower = command.lower().strip()
 
@@ -1002,6 +1215,10 @@ class TelegramBot:
             return self.reply_kline(request["coin"], request["timeframe"])
         if request["kind"] == "chart":
             return self.reply_chart(request["coin"], request["timeframe"])
+        if request["kind"] == "token_lookup":
+            if chat_id is None:
+                raise BotError("Chat id tidak tersedia untuk mark contract.")
+            return self.reply_token_lookup(request["address"], chat_id, user_label)
 
         raise BotError("Command belum dikenali.")
 
@@ -1085,6 +1302,17 @@ class TelegramBot:
         caption = f"CryptoWhale\n{result.symbol} {result.interval} - Binance Spot"
         return PhotoReply(photo=photo, caption=caption, filename=f"{result.symbol}_{result.interval}.png")
 
+    def reply_token_lookup(self, address: str, chat_id: int, user_label: str) -> str:
+        snapshot = self.token_client.get_token_snapshot(address)
+        mark = self.mark_store.get_or_create(
+            chat_id=chat_id,
+            chain_id=snapshot.chain_id,
+            address=snapshot.address,
+            user_label=user_label,
+            market_cap=snapshot.market_cap or snapshot.fdv,
+        )
+        return format_token_snapshot(snapshot, mark)
+
     def send_message(self, chat_id: int, text: str) -> None:
         self.telegram_request(
             "sendMessage",
@@ -1127,6 +1355,18 @@ def parse_user_request(text: str) -> dict[str, Any]:
 
     parts = clean.split()
     first = parts[0].split("@", 1)[0].lower() if parts else ""
+
+    contract_address = extract_contract_address(clean)
+    if contract_address and not first.startswith("/"):
+        return {"kind": "token_lookup", "address": contract_address}
+
+    if first in {"/ca", "/token"}:
+        if len(parts) < 2:
+            raise BotError("Format: /ca 0xcontract")
+        contract_address = extract_contract_address(parts[1])
+        if not contract_address:
+            raise BotError("Contract address tidak valid.")
+        return {"kind": "token_lookup", "address": contract_address}
 
     if first in {"/p", "/stats"}:
         if len(parts) < 2:
@@ -1252,6 +1492,38 @@ def is_quick_convert_amount_coin(text: str) -> bool:
     return bool(re.fullmatch(r"\d+(?:[.,]\d+)?\s+[a-zA-Z0-9$._-]+", text.strip()))
 
 
+def extract_contract_address(text: str) -> str | None:
+    match = re.search(r"0x[a-fA-F0-9]{40}", text)
+    return match.group(0) if match else None
+
+
+def normalize_contract_address(address: str) -> str:
+    match = re.fullmatch(r"0x[a-fA-F0-9]{40}", address.strip())
+    if not match:
+        raise BotError("Contract address tidak valid.")
+    return address.strip()
+
+
+def is_supported_token_pair(pair: dict[str, Any], address: str) -> bool:
+    chain_id = str(pair.get("chainId") or "")
+    if chain_id not in SUPPORTED_TOKEN_CHAINS:
+        return False
+    base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+    return str(base_token.get("address") or "").lower() == address.lower()
+
+
+def format_message_user(message: dict[str, Any]) -> str:
+    user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    username = user.get("username")
+    if username:
+        return f"@{username}"
+    name = " ".join(part for part in (user.get("first_name"), user.get("last_name")) if part)
+    if name:
+        return name
+    user_id = user.get("id")
+    return str(user_id) if user_id is not None else "unknown"
+
+
 def parse_amount(raw_amount: str) -> Decimal:
     try:
         amount = Decimal(raw_amount.replace(",", "."))
@@ -1265,12 +1537,83 @@ def parse_amount(raw_amount: str) -> Decimal:
 
 def decimal_from_payload(payload: dict[str, Any], key: str) -> Decimal | None:
     value = payload.get(key)
+    return decimal_from_any(value)
+
+
+def decimal_from_any(value: Any) -> Decimal | None:
     if value is None:
         return None
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def decimal_from_path(payload: dict[str, Any], path: tuple[str, ...]) -> Decimal | None:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return decimal_from_any(current)
+
+
+def int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def percent_decimal_from_ratio(value: Any) -> Decimal | None:
+    decimal_value = decimal_from_any(value)
+    if decimal_value is None:
+        return None
+    if abs(decimal_value) <= Decimal("1"):
+        return decimal_value * Decimal("100")
+    return decimal_value
+
+
+def value_to_yes_no(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text == "1" or text == "true":
+        return "Yes"
+    if text == "0" or text == "false":
+        return "No"
+    return str(value)
+
+
+def extract_websites(info: dict[str, Any]) -> list[str]:
+    websites = info.get("websites")
+    if not isinstance(websites, list):
+        return []
+    result = []
+    for website in websites:
+        if isinstance(website, dict) and isinstance(website.get("url"), str):
+            result.append(website["url"])
+    return result
+
+
+def extract_socials(info: dict[str, Any]) -> list[str]:
+    socials = info.get("socials")
+    if not isinstance(socials, list):
+        return []
+    labels = []
+    for social in socials:
+        if not isinstance(social, dict):
+            continue
+        platform = str(social.get("platform") or social.get("type") or "").lower()
+        if platform in {"twitter", "x"}:
+            labels.append("X")
+        elif platform in {"telegram", "tg"}:
+            labels.append("TG")
+        elif platform:
+            labels.append(platform.upper())
+    return labels
 
 
 def format_market_stats(stats: MarketStats) -> str:
@@ -1315,6 +1658,127 @@ def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
             ]
         )
     return "\n".join(lines)
+
+
+def format_token_snapshot(snapshot: TokenSnapshot, mark: TokenMark) -> str:
+    market_cap = snapshot.market_cap or snapshot.fdv
+    h1_tx = format_txns(snapshot.buys_h1, snapshot.sells_h1)
+    h24_tx = format_txns(snapshot.buys_h24, snapshot.sells_h24)
+    lines = [
+        f"🔎 {snapshot.symbol} ({snapshot.name})",
+        f"└ {short_address(snapshot.address)}",
+        f"└ #{snapshot.chain_tag} | {snapshot.dex_id.upper()} | age {format_pair_age(snapshot.pair_created_at_ms)}",
+        "",
+        "📊 Stats",
+        f"├USD     {format_optional_usd(snapshot.price_usd)}",
+        f"├MC      {format_optional_compact_usd(market_cap)}",
+        f"├Vol     {format_optional_compact_usd(snapshot.volume_24h)}",
+        f"├LP      {format_optional_compact_usd(snapshot.liquidity_usd)}",
+        f"├1H      {format_optional_percent(snapshot.change_h1)} | {h1_tx}",
+        f"└24H     {format_optional_percent(snapshot.change_h24)} | {h24_tx}",
+        "",
+        "🔗 Socials",
+        f"└ {format_socials(snapshot)}",
+        "",
+        "🔒 Security",
+    ]
+    lines.extend(format_security_lines(snapshot.security))
+    lines.extend(
+        [
+            "",
+            format_contract_mark(mark, market_cap),
+        ]
+    )
+    if snapshot.pair_url:
+        lines.append(snapshot.pair_url)
+    return "\n".join(lines)
+
+
+def format_security_lines(security: TokenSecurity | None) -> list[str]:
+    if security is None:
+        return ["└ Security data unavailable"]
+    return [
+        f"├Tax B/S  {format_security_percent(security.buy_tax)} / {format_security_percent(security.sell_tax)}",
+        f"├HoneyPot {security.is_honeypot or 'N/A'}",
+        f"├OpenSrc  {security.is_open_source or 'N/A'}",
+        f"├Top 10   {format_security_percent(security.top_10_holder_rate)}",
+        f"└Holders  {security.holder_count or 'N/A'} | LP holders {security.lp_holder_count or 'N/A'}",
+    ]
+
+
+def format_contract_mark(mark: TokenMark, current_market_cap: Decimal | None) -> str:
+    first_mcap = mark.first_market_cap
+    elapsed = format_elapsed_seconds(int(time.time()) - mark.first_seen)
+    icon = "🆕" if mark.is_new else "😈"
+    if first_mcap and first_mcap > 0 and current_market_cap is not None:
+        change = ((current_market_cap - first_mcap) / first_mcap) * Decimal("100")
+        change_text = format_mark_percent(change)
+    else:
+        change_text = "N/A"
+    return f"{icon} {mark.first_user} @ {format_optional_compact_usd(first_mcap)} [{change_text}] ({elapsed})"
+
+
+def short_address(address: str) -> str:
+    cleaned = address.strip()
+    if len(cleaned) <= 14:
+        return cleaned
+    return f"{cleaned[:6]}...{cleaned[-4:]}"
+
+
+def format_pair_age(pair_created_at_ms: int | None) -> str:
+    if not pair_created_at_ms:
+        return "N/A"
+    elapsed = int(time.time()) - int(pair_created_at_ms / 1000)
+    return format_elapsed_seconds(elapsed)
+
+
+def format_elapsed_seconds(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    minute = 60
+    hour = minute * 60
+    day = hour * 24
+    week = day * 7
+    month = day * 30
+    year = day * 365
+    if seconds >= year:
+        return f"{seconds // year}y"
+    if seconds >= month:
+        return f"{seconds // month}mo"
+    if seconds >= week:
+        return f"{seconds // week}w"
+    if seconds >= day:
+        return f"{seconds // day}d"
+    if seconds >= hour:
+        return f"{seconds // hour}h"
+    if seconds >= minute:
+        return f"{seconds // minute}m"
+    return f"{seconds}s"
+
+
+def format_socials(snapshot: TokenSnapshot) -> str:
+    labels = []
+    labels.extend(snapshot.socials)
+    if snapshot.websites:
+        labels.append("Web")
+    if not labels:
+        return "N/A"
+    return " · ".join(sorted(set(labels)))
+
+
+def format_txns(buys: int | None, sells: int | None) -> str:
+    return f"🟢 {buys or 0} 🔴 {sells or 0}"
+
+
+def format_security_percent(value: Decimal | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{format_decimal(value.quantize(Decimal('0.01')))}%"
+
+
+def format_mark_percent(value: Decimal) -> str:
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{format_decimal(value.quantize(Decimal('0.01')))}%"
 
 
 def format_gas_estimate(estimate: GasEstimate) -> str:
@@ -1440,6 +1904,8 @@ def generic_get_json(url: str, params: dict[str, Any] | None = None) -> Any:
         body = exc.read().decode("utf-8", errors="replace")
         message = parse_error_message(body) or str(exc)
         raise BotError(f"HTTP error ({exc.code}): {message}") from exc
+    except urllib.error.URLError as exc:
+        raise BotError(f"{url} gagal diakses: {exc.reason}") from exc
 
 
 def generic_post_json(url: str, payload: dict[str, Any]) -> Any:
@@ -1729,6 +2195,8 @@ def main() -> int:
             etherscan_api_key=os.environ.get("ETHERSCAN_API_KEY"),
             rpc_urls=eth_rpc_urls,
         ),
+        token_client=TokenLookupClient(),
+        mark_store=TokenMarkStore(),
     )
     bot.run_forever()
     return 0

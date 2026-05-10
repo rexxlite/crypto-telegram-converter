@@ -1,4 +1,5 @@
 .env
 .telegram_offset
+.token_marks.json
 __pycache__/
 *.py[cod]

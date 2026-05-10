@@ -9,9 +9,11 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/p btc` menampilkan ringkasan harga, H/L, perubahan 1h/24h/7d/30d, ATH, volume, dan market cap.
 - `/mp btc sol eth` menampilkan ringkasan harga beberapa coin sekaligus.
 - `/gas` menampilkan gas Ethereum realtime dalam gwei.
+- `/ca 0xcontract` menampilkan data token dari contract address ETH, Base, atau BNB Chain.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
 - `/convert 250 doge idr` mengonversi jumlah coin ke IDR.
 - `0.1 btc` mengonversi cepat ke USD dan IDR tanpa slash command.
+- `0xcontract` langsung menampilkan data token jika user paste contract address di grup/private chat.
 - `/tv eth` mengirim gambar chart ETHUSDT timeframe default 1h.
 - `/tv eth 15m` mengirim gambar chart ETHUSDT timeframe 15 menit.
 - `/kline btc 15m` menampilkan candle BTCUSDT timeframe 15 menit dalam bentuk teks.
@@ -65,10 +67,12 @@ python3 bot.py
 ## Catatan
 
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
-- Bot hanya merespons command yang diawali `/` dan pola konversi cepat seperti `0.1 btc`; pesan biasa di private chat atau grup akan diabaikan.
+- Bot hanya merespons command yang diawali `/`, pola konversi cepat seperti `0.1 btc`, dan contract address EVM `0x...`; pesan biasa di private chat atau grup akan diabaikan.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
 - Command `/p` memakai CoinGecko untuk data market lengkap seperti ATH, market cap, volume, dan perubahan 7d/30d.
 - Command `/gas` memakai Etherscan Gas Oracle jika `ETHERSCAN_API_KEY` diisi, lalu fallback ke public Ethereum RPC `eth_feeHistory`.
+- Contract address lookup memakai DexScreener untuk data token/pair dan GoPlus Labs untuk data security best-effort.
+- Mark contract pertama per grup disimpan lokal di `.token_marks.json`, berisi user pertama yang paste, waktu pertama, dan market cap pertama.
 - Bot mencoba beberapa endpoint Binance secara berurutan, termasuk `data-api.binance.vision` untuk market data.
 - Chart dibuat lokal di VPS dengan `matplotlib`, lalu dikirim ke Telegram sebagai foto.
 - Harga USD memakai pair USDT Binance, misalnya BTCUSDT.
