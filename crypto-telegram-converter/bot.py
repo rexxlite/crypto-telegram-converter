@@ -292,6 +292,12 @@ class TokenSecurity:
 
 
 @dataclass
+class TokenLink:
+    label: str
+    url: str
+
+
+@dataclass
 class TokenSnapshot:
     chain_id: str
     chain_tag: str
@@ -313,8 +319,8 @@ class TokenSnapshot:
     buys_h24: int | None
     sells_h24: int | None
     pair_created_at_ms: int | None
-    websites: list[str]
-    socials: list[str]
+    websites: list[TokenLink]
+    socials: list[TokenLink]
     security: TokenSecurity | None
 
 
@@ -1599,33 +1605,40 @@ def value_to_yes_no(value: Any) -> str | None:
     return str(value)
 
 
-def extract_websites(info: dict[str, Any]) -> list[str]:
+def extract_websites(info: dict[str, Any]) -> list[TokenLink]:
     websites = info.get("websites")
     if not isinstance(websites, list):
         return []
-    result = []
+    result: list[TokenLink] = []
     for website in websites:
         if isinstance(website, dict) and isinstance(website.get("url"), str):
-            result.append(website["url"])
+            label = str(website.get("label") or "Web").strip() or "Web"
+            result.append(TokenLink(label=label, url=website["url"]))
     return result
 
 
-def extract_socials(info: dict[str, Any]) -> list[str]:
+def extract_socials(info: dict[str, Any]) -> list[TokenLink]:
     socials = info.get("socials")
     if not isinstance(socials, list):
         return []
-    labels = []
+    links: list[TokenLink] = []
     for social in socials:
         if not isinstance(social, dict):
             continue
         platform = str(social.get("platform") or social.get("type") or "").lower()
+        url = social.get("url")
+        if not isinstance(url, str):
+            continue
         if platform in {"twitter", "x"}:
-            labels.append("X")
+            label = "X"
         elif platform in {"telegram", "tg"}:
-            labels.append("TG")
+            label = "TG"
         elif platform:
-            labels.append(platform.upper())
-    return labels
+            label = platform.upper()
+        else:
+            label = "Social"
+        links.append(TokenLink(label=label, url=url))
+    return links
 
 
 def format_market_stats(stats: MarketStats) -> str:
@@ -1675,45 +1688,55 @@ def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
 def format_token_snapshot(snapshot: TokenSnapshot, mark: TokenMark) -> str:
     market_cap = snapshot.market_cap or snapshot.fdv
     token_name = f"{snapshot.symbol} ({snapshot.name})"
-    pair_meta = f"#{snapshot.chain_tag} · {snapshot.dex_id.upper()} · age {format_pair_age(snapshot.pair_created_at_ms)}"
-    details = [
-        "📊 STATS",
-        format_pre_line("USD", format_optional_usd(snapshot.price_usd)),
-        format_pre_line("MC", format_optional_compact_usd(market_cap)),
-        format_pre_line("Vol", format_optional_compact_usd(snapshot.volume_24h)),
-        format_pre_line("LP", format_optional_compact_usd(snapshot.liquidity_usd)),
-        format_pre_line("1H", f"{format_optional_percent(snapshot.change_h1)} | {format_txns(snapshot.buys_h1, snapshot.sells_h1)}"),
-        format_pre_line("24H", f"{format_optional_percent(snapshot.change_h24)} | {format_txns(snapshot.buys_h24, snapshot.sells_h24)}"),
-        "",
-        "🔗 SOCIALS",
-        format_pre_line("Links", format_socials(snapshot)),
-        "",
-        "🔒 SECURITY",
-    ]
-    details.extend(format_security_lines(snapshot.security))
+    pair_meta = f"#{snapshot.chain_tag} | {snapshot.dex_id.upper()} | age {format_pair_age(snapshot.pair_created_at_ms)}"
+    explorer_url = explorer_token_url(snapshot)
+    address_line = f"├<code>{html_escape(snapshot.address)}</code>"
+    if explorer_url:
+        address_line += f' <a href="{html_escape(explorer_url, quote=True)}">scan</a>'
+
     lines = [
         f"🔎 <b>{html_escape(token_name)}</b>",
-        f"<code>{html_escape(short_address(snapshot.address))}</code>",
-        f"<code>{html_escape(pair_meta)}</code>",
+        address_line,
+        f"└<code>{html_escape(pair_meta)}</code>",
         "",
-        f"<pre>{html_escape(chr(10).join(details))}</pre>",
+        "📊 <b>Stats</b>",
+        format_token_data_line("├", "USD", format_optional_usd(snapshot.price_usd)),
+        format_token_data_line("├", "MC", format_optional_compact_usd(market_cap)),
+        format_token_data_line("├", "Vol", format_optional_compact_usd(snapshot.volume_24h)),
+        format_token_data_line("├", "LP", format_optional_compact_usd(snapshot.liquidity_usd)),
+        format_token_data_line(
+            "├",
+            "1H",
+            format_optional_percent(snapshot.change_h1),
+            f" | {format_txns_html(snapshot.buys_h1, snapshot.sells_h1)}",
+        ),
+        format_token_data_line(
+            "└",
+            "24H",
+            format_optional_percent(snapshot.change_h24),
+            f" | {format_txns_html(snapshot.buys_h24, snapshot.sells_h24)}",
+        ),
+        "",
+        f"🔗 <b>Socials</b>",
+        f"└ {format_social_links_html(snapshot, explorer_url)}",
+        "",
+        "🔒 <b>Security</b>",
+        *format_security_lines(snapshot.security),
         "",
         format_contract_mark_html(mark, market_cap),
     ]
-    if snapshot.pair_url:
-        lines.append(f'<a href="{html_escape(snapshot.pair_url, quote=True)}">Open DexScreener</a>')
     return "\n".join(lines)
 
 
 def format_security_lines(security: TokenSecurity | None) -> list[str]:
     if security is None:
-        return ["Security data unavailable"]
+        return ["└ Security data unavailable"]
     return [
-        format_pre_line("Tax", f"{format_security_percent(security.buy_tax)} buy / {format_security_percent(security.sell_tax)} sell"),
-        format_pre_line("Honey", security.is_honeypot or "N/A"),
-        format_pre_line("Source", security.is_open_source or "N/A"),
-        format_pre_line("Top10", format_security_percent(security.top_10_holder_rate)),
-        format_pre_line("Holders", f"{security.holder_count or 'N/A'} | LP {security.lp_holder_count or 'N/A'}"),
+        format_token_data_line("├", "Tax", f"{format_security_percent(security.buy_tax)} buy / {format_security_percent(security.sell_tax)} sell"),
+        format_token_data_line("├", "Honey", security.is_honeypot or "N/A"),
+        format_token_data_line("├", "Source", security.is_open_source or "N/A"),
+        format_token_data_line("├", "Top10", format_security_percent(security.top_10_holder_rate)),
+        format_token_data_line("└", "Holders", f"{security.holder_count or 'N/A'} | LP {security.lp_holder_count or 'N/A'}"),
     ]
 
 
@@ -1729,12 +1752,64 @@ def format_contract_mark_html(mark: TokenMark, current_market_cap: Decimal | Non
     return (
         f"{icon} <b>{html_escape(mark.first_user)}</b> @ "
         f"<b>{html_escape(format_optional_compact_usd(first_mcap))}</b> "
-        f"<code>[{html_escape(change_text)}]</code> ({html_escape(elapsed)})"
+        f"<b>[{html_escape(change_text)}]</b> ({html_escape(elapsed)})"
     )
 
 
-def format_pre_line(label: str, value: str) -> str:
-    return f"{label:<7} {value}"
+def format_token_data_line(prefix: str, label: str, value: str, extra_html: str = "") -> str:
+    return f"{prefix}<code>{html_escape(label + ':'):<8}</code> <b>{html_escape(value)}</b>{extra_html}"
+
+
+def format_txns_html(buys: int | None, sells: int | None) -> str:
+    return f"🟢 <b>{buys or 0}</b> 🔴 <b>{sells or 0}</b>"
+
+
+def format_social_links_html(snapshot: TokenSnapshot, explorer_url: str | None) -> str:
+    links: list[TokenLink] = []
+    links.extend(snapshot.socials)
+    links.extend(TokenLink(label=normalize_website_label(link.label), url=link.url) for link in snapshot.websites)
+    if snapshot.pair_url:
+        links.append(TokenLink(label="DEX", url=snapshot.pair_url))
+    if explorer_url:
+        links.append(TokenLink(label="Scan", url=explorer_url))
+
+    unique_links = dedupe_token_links(links)
+    if not unique_links:
+        return "N/A"
+    return " · ".join(format_html_link(link.label, link.url) for link in unique_links)
+
+
+def dedupe_token_links(links: list[TokenLink]) -> list[TokenLink]:
+    seen: set[tuple[str, str]] = set()
+    result: list[TokenLink] = []
+    for link in links:
+        key = (link.label.lower(), link.url)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(link)
+    return result
+
+
+def normalize_website_label(label: str) -> str:
+    normalized = label.strip()
+    if not normalized or normalized.lower() in {"website", "site", "homepage"}:
+        return "Web"
+    return normalized[:12]
+
+
+def format_html_link(label: str, url: str) -> str:
+    return f'<a href="{html_escape(url, quote=True)}">{html_escape(label)}</a>'
+
+
+def explorer_token_url(snapshot: TokenSnapshot) -> str | None:
+    if snapshot.chain_id == "ethereum":
+        return f"https://etherscan.io/token/{snapshot.address}"
+    if snapshot.chain_id == "base":
+        return f"https://basescan.org/token/{snapshot.address}"
+    if snapshot.chain_id == "bsc":
+        return f"https://bscscan.com/token/{snapshot.address}"
+    return None
 
 
 def html_escape(value: Any, quote: bool = False) -> str:
@@ -1780,10 +1855,8 @@ def format_elapsed_seconds(seconds: int) -> str:
 
 
 def format_socials(snapshot: TokenSnapshot) -> str:
-    labels = []
-    labels.extend(snapshot.socials)
-    if snapshot.websites:
-        labels.append("Web")
+    labels = [link.label for link in snapshot.socials]
+    labels.extend(normalize_website_label(link.label) for link in snapshot.websites)
     if not labels:
         return "N/A"
     return " · ".join(sorted(set(labels)))
