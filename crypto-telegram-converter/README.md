@@ -11,6 +11,7 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/gas` menampilkan gas Ethereum realtime dalam gwei.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
 - `/convert 250 doge idr` mengonversi jumlah coin ke IDR.
+- `0.1 btc` mengonversi cepat ke USD dan IDR tanpa slash command.
 - `/tv eth` mengirim gambar chart ETHUSDT timeframe default 1h.
 - `/tv eth 15m` mengirim gambar chart ETHUSDT timeframe 15 menit.
 - `/kline btc 15m` menampilkan candle BTCUSDT timeframe 15 menit dalam bentuk teks.
@@ -64,7 +65,7 @@ python3 bot.py
 ## Catatan
 
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
-- Bot hanya merespons command yang diawali `/`; pesan biasa di private chat atau grup akan diabaikan.
+- Bot hanya merespons command yang diawali `/` dan pola konversi cepat seperti `0.1 btc`; pesan biasa di private chat atau grup akan diabaikan.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
 - Command `/p` memakai CoinGecko untuk data market lengkap seperti ATH, market cap, volume, dan perubahan 7d/30d.
 - Command `/gas` memakai Etherscan Gas Oracle jika `ETHERSCAN_API_KEY` diisi, lalu fallback ke public Ethereum RPC `eth_feeHistory`.

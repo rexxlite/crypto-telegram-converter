@@ -149,6 +149,7 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /gas
 /convert 0.5 btc usd
 /convert 250 doge idr
+0.1 btc
 /tv eth
 /tv eth 15m
 /kline btc 15m
@@ -962,7 +963,7 @@ class TelegramBot:
 
         if chat_id is None or not text:
             return
-        if not text.startswith("/"):
+        if not text.startswith("/") and not is_quick_convert_amount_coin(text):
             return
 
         try:
@@ -995,6 +996,8 @@ class TelegramBot:
             return self.reply_multi_market_stats(request["coins"])
         if request["kind"] == "convert":
             return self.reply_convert(request["amount"], request["coin"], request["currency"])
+        if request["kind"] == "convert_default":
+            return self.reply_convert_default(request["amount"], request["coin"])
         if request["kind"] == "kline":
             return self.reply_kline(request["coin"], request["timeframe"])
         if request["kind"] == "chart":
@@ -1041,6 +1044,19 @@ class TelegramBot:
             f"Update: {format_datetime(result.updated_at)}",
             "Sumber: Binance Spot",
         ]
+        return "\n".join(lines)
+
+    def reply_convert_default(self, amount: Decimal, coin: str) -> str:
+        result = self.price_client.get_prices(coin, ("usd", "idr"))
+
+        lines = [f"{format_decimal(amount)} {result.asset} ="]
+        for target in ("usd", "idr"):
+            price = result.prices[target]
+            total = amount * price
+            lines.append(f"- {target.upper()}: {format_money(total, target)}")
+        lines.append(f"Harga 1 {result.asset}: {format_money(result.prices['usd'], 'usd')} ({result.source_symbols['usd']})")
+        lines.append(f"Update: {format_datetime(result.updated_at)}")
+        lines.append("Sumber: Binance Spot")
         return "\n".join(lines)
 
     def reply_kline(self, coin: str, timeframe: str) -> str:
@@ -1157,6 +1173,17 @@ def parse_user_request(text: str) -> dict[str, Any]:
         currency = normalize_currency(parts[3])
         return {"kind": "convert", "amount": amount, "coin": coin, "currency": currency}
 
+    quick_default_convert = re.fullmatch(
+        r"(?P<amount>\d+(?:[.,]\d+)?)\s+(?P<coin>[a-zA-Z0-9$._-]+)",
+        lower,
+    )
+    if quick_default_convert:
+        return {
+            "kind": "convert_default",
+            "amount": parse_amount(quick_default_convert.group("amount")),
+            "coin": quick_default_convert.group("coin"),
+        }
+
     quick_convert = re.fullmatch(
         r"(?P<amount>\d+(?:[.,]\d+)?)\s+(?P<coin>[a-zA-Z0-9$._-]+)\s+(?:to|ke)\s+(?P<currency>usd|usdt|idr)",
         lower,
@@ -1219,6 +1246,10 @@ def is_timeframe(value: str | None) -> bool:
     except BotError:
         return False
     return True
+
+
+def is_quick_convert_amount_coin(text: str) -> bool:
+    return bool(re.fullmatch(r"\d+(?:[.,]\d+)?\s+[a-zA-Z0-9$._-]+", text.strip()))
 
 
 def parse_amount(raw_amount: str) -> Decimal:
