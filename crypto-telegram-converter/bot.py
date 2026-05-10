@@ -10,6 +10,7 @@ Bot ini sengaja memakai Python standard library saja agar mudah dijalankan:
 from __future__ import annotations
 
 import json
+import html
 import os
 import re
 import secrets
@@ -240,6 +241,12 @@ class PhotoReply:
     photo: bytes
     caption: str
     filename: str = "chart.png"
+
+
+@dataclass
+class TextReply:
+    text: str
+    parse_mode: str | None = None
 
 
 @dataclass
@@ -1186,10 +1193,12 @@ class TelegramBot:
 
         if isinstance(reply, PhotoReply):
             self.send_photo(chat_id, reply.photo, reply.caption, reply.filename)
+        elif isinstance(reply, TextReply):
+            self.send_message(chat_id, reply.text, parse_mode=reply.parse_mode)
         else:
             self.send_message(chat_id, reply)
 
-    def build_reply(self, text: str, chat_id: int | None = None, user_label: str = "unknown") -> str | PhotoReply:
+    def build_reply(self, text: str, chat_id: int | None = None, user_label: str = "unknown") -> str | PhotoReply | TextReply:
         command = strip_bot_mention(text)
         lower = command.lower().strip()
 
@@ -1302,7 +1311,7 @@ class TelegramBot:
         caption = f"CryptoWhale\n{result.symbol} {result.interval} - Binance Spot"
         return PhotoReply(photo=photo, caption=caption, filename=f"{result.symbol}_{result.interval}.png")
 
-    def reply_token_lookup(self, address: str, chat_id: int, user_label: str) -> str:
+    def reply_token_lookup(self, address: str, chat_id: int, user_label: str) -> TextReply:
         snapshot = self.token_client.get_token_snapshot(address)
         mark = self.mark_store.get_or_create(
             chat_id=chat_id,
@@ -1311,16 +1320,19 @@ class TelegramBot:
             user_label=user_label,
             market_cap=snapshot.market_cap or snapshot.fdv,
         )
-        return format_token_snapshot(snapshot, mark)
+        return TextReply(format_token_snapshot(snapshot, mark), parse_mode="HTML")
 
-    def send_message(self, chat_id: int, text: str) -> None:
+    def send_message(self, chat_id: int, text: str, parse_mode: str | None = None) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         self.telegram_request(
             "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            },
+            payload,
         )
 
     def send_photo(self, chat_id: int, photo: bytes, caption: str, filename: str) -> None:
@@ -1662,51 +1674,50 @@ def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
 
 def format_token_snapshot(snapshot: TokenSnapshot, mark: TokenMark) -> str:
     market_cap = snapshot.market_cap or snapshot.fdv
-    h1_tx = format_txns(snapshot.buys_h1, snapshot.sells_h1)
-    h24_tx = format_txns(snapshot.buys_h24, snapshot.sells_h24)
-    lines = [
-        f"🔎 {snapshot.symbol} ({snapshot.name})",
-        f"└ {short_address(snapshot.address)}",
-        f"└ #{snapshot.chain_tag} | {snapshot.dex_id.upper()} | age {format_pair_age(snapshot.pair_created_at_ms)}",
+    token_name = f"{snapshot.symbol} ({snapshot.name})"
+    pair_meta = f"#{snapshot.chain_tag} · {snapshot.dex_id.upper()} · age {format_pair_age(snapshot.pair_created_at_ms)}"
+    details = [
+        "📊 STATS",
+        format_pre_line("USD", format_optional_usd(snapshot.price_usd)),
+        format_pre_line("MC", format_optional_compact_usd(market_cap)),
+        format_pre_line("Vol", format_optional_compact_usd(snapshot.volume_24h)),
+        format_pre_line("LP", format_optional_compact_usd(snapshot.liquidity_usd)),
+        format_pre_line("1H", f"{format_optional_percent(snapshot.change_h1)} | {format_txns(snapshot.buys_h1, snapshot.sells_h1)}"),
+        format_pre_line("24H", f"{format_optional_percent(snapshot.change_h24)} | {format_txns(snapshot.buys_h24, snapshot.sells_h24)}"),
         "",
-        "📊 Stats",
-        f"├USD     {format_optional_usd(snapshot.price_usd)}",
-        f"├MC      {format_optional_compact_usd(market_cap)}",
-        f"├Vol     {format_optional_compact_usd(snapshot.volume_24h)}",
-        f"├LP      {format_optional_compact_usd(snapshot.liquidity_usd)}",
-        f"├1H      {format_optional_percent(snapshot.change_h1)} | {h1_tx}",
-        f"└24H     {format_optional_percent(snapshot.change_h24)} | {h24_tx}",
+        "🔗 SOCIALS",
+        format_pre_line("Links", format_socials(snapshot)),
         "",
-        "🔗 Socials",
-        f"└ {format_socials(snapshot)}",
-        "",
-        "🔒 Security",
+        "🔒 SECURITY",
     ]
-    lines.extend(format_security_lines(snapshot.security))
-    lines.extend(
-        [
-            "",
-            format_contract_mark(mark, market_cap),
-        ]
-    )
+    details.extend(format_security_lines(snapshot.security))
+    lines = [
+        f"🔎 <b>{html_escape(token_name)}</b>",
+        f"<code>{html_escape(short_address(snapshot.address))}</code>",
+        f"<code>{html_escape(pair_meta)}</code>",
+        "",
+        f"<pre>{html_escape(chr(10).join(details))}</pre>",
+        "",
+        format_contract_mark_html(mark, market_cap),
+    ]
     if snapshot.pair_url:
-        lines.append(snapshot.pair_url)
+        lines.append(f'<a href="{html_escape(snapshot.pair_url, quote=True)}">Open DexScreener</a>')
     return "\n".join(lines)
 
 
 def format_security_lines(security: TokenSecurity | None) -> list[str]:
     if security is None:
-        return ["└ Security data unavailable"]
+        return ["Security data unavailable"]
     return [
-        f"├Tax B/S  {format_security_percent(security.buy_tax)} / {format_security_percent(security.sell_tax)}",
-        f"├HoneyPot {security.is_honeypot or 'N/A'}",
-        f"├OpenSrc  {security.is_open_source or 'N/A'}",
-        f"├Top 10   {format_security_percent(security.top_10_holder_rate)}",
-        f"└Holders  {security.holder_count or 'N/A'} | LP holders {security.lp_holder_count or 'N/A'}",
+        format_pre_line("Tax", f"{format_security_percent(security.buy_tax)} buy / {format_security_percent(security.sell_tax)} sell"),
+        format_pre_line("Honey", security.is_honeypot or "N/A"),
+        format_pre_line("Source", security.is_open_source or "N/A"),
+        format_pre_line("Top10", format_security_percent(security.top_10_holder_rate)),
+        format_pre_line("Holders", f"{security.holder_count or 'N/A'} | LP {security.lp_holder_count or 'N/A'}"),
     ]
 
 
-def format_contract_mark(mark: TokenMark, current_market_cap: Decimal | None) -> str:
+def format_contract_mark_html(mark: TokenMark, current_market_cap: Decimal | None) -> str:
     first_mcap = mark.first_market_cap
     elapsed = format_elapsed_seconds(int(time.time()) - mark.first_seen)
     icon = "🆕" if mark.is_new else "😈"
@@ -1715,7 +1726,19 @@ def format_contract_mark(mark: TokenMark, current_market_cap: Decimal | None) ->
         change_text = format_mark_percent(change)
     else:
         change_text = "N/A"
-    return f"{icon} {mark.first_user} @ {format_optional_compact_usd(first_mcap)} [{change_text}] ({elapsed})"
+    return (
+        f"{icon} <b>{html_escape(mark.first_user)}</b> @ "
+        f"<b>{html_escape(format_optional_compact_usd(first_mcap))}</b> "
+        f"<code>[{html_escape(change_text)}]</code> ({html_escape(elapsed)})"
+    )
+
+
+def format_pre_line(label: str, value: str) -> str:
+    return f"{label:<7} {value}"
+
+
+def html_escape(value: Any, quote: bool = False) -> str:
+    return html.escape(str(value), quote=quote)
 
 
 def short_address(address: str) -> str:
