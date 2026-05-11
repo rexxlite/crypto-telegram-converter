@@ -11,6 +11,7 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/gas` menampilkan gas Ethereum realtime dalam gwei.
 - `/ca 0xcontract` menampilkan data token dari contract address ETH, Base, atau BNB Chain.
 - Info token punya tombol hapus, refresh data, dan buka DEX langsung dari bawah pesan.
+- Template teks seperti `/p`, `/mp`, `/gas`, `/price`, `/convert`, dan `/kline` memakai format HTML yang rapi seperti scan token.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
 - `/convert 250 doge idr` mengonversi jumlah coin ke IDR.
 - `0.1 btc` mengonversi cepat ke USD dan IDR tanpa slash command.

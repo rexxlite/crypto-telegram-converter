@@ -1408,7 +1408,7 @@ class TelegramBot:
         if lower in {"/start", "/help"}:
             return HELP_TEXT
         if lower in {"/timeframes", "/tf"}:
-            return reply_timeframes()
+            return build_html_text_reply(reply_timeframes())
         if lower == "/gas":
             return self.reply_gas()
 
@@ -1434,79 +1434,36 @@ class TelegramBot:
 
         raise BotError("Command belum dikenali.")
 
-    def reply_price(self, coin: str, currency: str | None) -> str:
+    def reply_price(self, coin: str, currency: str | None) -> TextReply:
         targets = (currency.lower(),) if currency else DEFAULT_VS_CURRENCIES
         result = self.price_client.get_prices(coin, targets)
+        return build_html_text_reply(format_price_result(result, targets))
 
-        lines = [f"Harga {result.asset} sekarang:"]
-        for target in targets:
-            price = result.prices.get(target)
-            if price is None:
-                continue
-            source_symbol = result.source_symbols.get(target, "Binance")
-            lines.append(f"- {target.upper()}: {format_money(price, target)} ({source_symbol})")
-
-        lines.append(f"\nUpdate: {format_datetime(result.updated_at)}")
-        lines.append("Sumber: Binance Spot")
-        return "\n".join(lines)
-
-    def reply_market_stats(self, coin: str) -> str:
+    def reply_market_stats(self, coin: str) -> TextReply:
         stats = self.stats_client.get_stats(coin)
-        return format_market_stats(stats)
+        return build_html_text_reply(format_market_stats(stats))
 
-    def reply_multi_market_stats(self, coins: list[str]) -> str:
+    def reply_multi_market_stats(self, coins: list[str]) -> TextReply:
         stats = self.stats_client.get_multi_stats(coins)
-        return format_multi_market_stats(stats)
+        return build_html_text_reply(format_multi_market_stats(stats))
 
-    def reply_gas(self) -> str:
-        return format_gas_estimate(self.gas_client.get_gas())
+    def reply_gas(self) -> TextReply:
+        return build_html_text_reply(format_gas_estimate(self.gas_client.get_gas()))
 
-    def reply_convert(self, amount: Decimal, coin: str, currency: str) -> str:
+    def reply_convert(self, amount: Decimal, coin: str, currency: str) -> TextReply:
         target = currency.lower()
         result = self.price_client.get_prices(coin, (target,))
         price = result.prices[target]
         total = amount * price
+        return build_html_text_reply(format_convert_result(amount, result, target, price, total))
 
-        lines = [
-            f"{format_decimal(amount)} {result.asset} = {format_money(total, target)}",
-            f"Harga 1 {result.asset}: {format_money(price, target)} ({result.source_symbols[target]})",
-            f"Update: {format_datetime(result.updated_at)}",
-            "Sumber: Binance Spot",
-        ]
-        return "\n".join(lines)
-
-    def reply_convert_default(self, amount: Decimal, coin: str) -> str:
+    def reply_convert_default(self, amount: Decimal, coin: str) -> TextReply:
         result = self.price_client.get_prices(coin, ("usd", "idr"))
+        return build_html_text_reply(format_convert_default_result(amount, result))
 
-        lines = [f"{format_decimal(amount)} {result.asset} ="]
-        for target in ("usd", "idr"):
-            price = result.prices[target]
-            total = amount * price
-            lines.append(f"- {target.upper()}: {format_money(total, target)}")
-        lines.append(f"Harga 1 {result.asset}: {format_money(result.prices['usd'], 'usd')} ({result.source_symbols['usd']})")
-        lines.append(f"Update: {format_datetime(result.updated_at)}")
-        lines.append("Sumber: Binance Spot")
-        return "\n".join(lines)
-
-    def reply_kline(self, coin: str, timeframe: str) -> str:
+    def reply_kline(self, coin: str, timeframe: str) -> TextReply:
         result = self.price_client.get_kline(coin, timeframe)
-        sign = "+" if result.change_percent >= 0 else ""
-
-        return "\n".join(
-            [
-                f"{result.symbol} candle {result.interval}",
-                f"Harga live: {format_quote_money(result.live_price, 'USDT')}",
-                f"Open: {format_quote_money(result.open_price, 'USDT')}",
-                f"High: {format_quote_money(result.high_price, 'USDT')}",
-                f"Low: {format_quote_money(result.low_price, 'USDT')}",
-                f"Close: {format_quote_money(result.close_price, 'USDT')}",
-                f"Change: {sign}{format_decimal(result.change_percent.quantize(Decimal('0.01')))}%",
-                f"Volume: {format_decimal(result.volume)} {result.asset}",
-                f"Trades: {result.trades}",
-                f"Open time: {format_ms_timestamp(result.open_time_ms)}",
-                "Sumber: Binance Spot",
-            ]
-        )
+        return build_html_text_reply(format_kline_result(result))
 
     def reply_chart(self, coin: str, timeframe: str) -> PhotoReply:
         result = self.price_client.get_klines(coin, timeframe)
@@ -1911,45 +1868,119 @@ def extract_socials(info: dict[str, Any]) -> list[TokenLink]:
     return links
 
 
-def format_market_stats(stats: MarketStats) -> str:
+def build_html_text_reply(text: str) -> TextReply:
+    return TextReply(text=text, parse_mode="HTML")
+
+
+def format_price_result(result: PriceResult, targets: tuple[str, ...]) -> str:
+    lines = [f"💱 <b>{html_escape(result.asset)} Price</b>"]
+    for index, target in enumerate(targets):
+        price = result.prices.get(target)
+        if price is None:
+            continue
+        prefix = "└" if index == len(targets) - 1 else "├"
+        source_symbol = result.source_symbols.get(target, "Binance")
+        lines.append(format_token_data_line(prefix, target.upper(), f"{format_money(price, target)} ({source_symbol})"))
+    lines.extend(
+        [
+            "",
+            format_token_data_line("├", "Update", format_datetime(result.updated_at)),
+            format_token_data_line("└", "Source", "Binance Spot"),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_convert_result(
+    amount: Decimal,
+    result: PriceResult,
+    target: str,
+    price: Decimal,
+    total: Decimal,
+) -> str:
     return "\n".join(
         [
-            f"Price: {format_usd_price(stats.price)}",
-            f"⤷ ₿ {format_asset_amount(stats.btc_value)} | Ξ {format_asset_amount(stats.eth_value)}",
-            f"⚖️ H/L: {format_optional_usd(stats.high_24h)} | {format_optional_usd(stats.low_24h)}",
-            format_percent_line("1h", stats.change_1h, "🚀"),
-            format_percent_line("24h", stats.change_24h, "🚀"),
-            format_percent_line("7d", stats.change_7d, "🚀"),
-            format_percent_line("30d", stats.change_30d, "🌕"),
-            f"🏆 ATH: {format_optional_usd(stats.ath)} ({format_optional_percent(stats.ath_change_percent)})",
-            f"📊 24h Vol: {format_optional_compact_usd(stats.volume_24h)}",
-            f"💎 MCap: {format_optional_compact_usd(stats.market_cap)}",
+            f"🔁 <b>Convert {html_escape(result.asset)}</b>",
+            format_token_data_line("├", "Amount", f"{format_decimal(amount)} {result.asset}"),
+            format_token_data_line("├", target.upper(), format_money(total, target)),
+            format_token_data_line("├", "Rate", f"{format_money(price, target)} ({result.source_symbols[target]})"),
+            format_token_data_line("├", "Update", format_datetime(result.updated_at)),
+            format_token_data_line("└", "Source", "Binance Spot"),
         ]
     )
 
 
-def format_percent_line(label: str, percent: Decimal | None, positive_icon: str) -> str:
-    icon = "📉" if percent is not None and percent < 0 else positive_icon
-    return f"{icon} {label}: {format_optional_percent(percent)}"
+def format_convert_default_result(amount: Decimal, result: PriceResult) -> str:
+    lines = [
+        f"🔁 <b>Convert {html_escape(result.asset)}</b>",
+        format_token_data_line("├", "Amount", f"{format_decimal(amount)} {result.asset}"),
+    ]
+    for target in ("usd", "idr"):
+        price = result.prices[target]
+        total = amount * price
+        lines.append(format_token_data_line("├", target.upper(), format_money(total, target)))
+    lines.extend(
+        [
+            format_token_data_line("├", "Rate", f"{format_money(result.prices['usd'], 'usd')} ({result.source_symbols['usd']})"),
+            format_token_data_line("├", "Update", format_datetime(result.updated_at)),
+            format_token_data_line("└", "Source", "Binance Spot"),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_kline_result(result: KlineResult) -> str:
+    sign = "+" if result.change_percent >= 0 else ""
+    return "\n".join(
+        [
+            f"🕯 <b>{html_escape(result.symbol)} Candle {html_escape(result.interval)}</b>",
+            format_token_data_line("├", "Live", format_quote_money(result.live_price, "USDT")),
+            format_token_data_line("├", "Open", format_quote_money(result.open_price, "USDT")),
+            format_token_data_line("├", "High", format_quote_money(result.high_price, "USDT")),
+            format_token_data_line("├", "Low", format_quote_money(result.low_price, "USDT")),
+            format_token_data_line("├", "Close", format_quote_money(result.close_price, "USDT")),
+            format_token_data_line("├", "Change", f"{sign}{format_decimal(result.change_percent.quantize(Decimal('0.01')))}%"),
+            format_token_data_line("├", "Volume", f"{format_decimal(result.volume)} {result.asset}"),
+            format_token_data_line("├", "Trades", str(result.trades)),
+            format_token_data_line("├", "OpenTime", format_ms_timestamp(result.open_time_ms)),
+            format_token_data_line("└", "Source", "Binance Spot"),
+        ]
+    )
+
+
+def format_market_stats(stats: MarketStats) -> str:
+    return "\n".join(
+        [
+            f"📊 <b>{html_escape(stats.asset)} Market</b>",
+            format_token_data_line("├", "Price", format_usd_price(stats.price)),
+            format_token_data_line("├", "BTC", format_asset_amount(stats.btc_value)),
+            format_token_data_line("├", "ETH", format_asset_amount(stats.eth_value)),
+            format_token_data_line("├", "H/L", f"{format_optional_usd(stats.high_24h)} / {format_optional_usd(stats.low_24h)}"),
+            format_token_data_line("├", "1H", format_optional_percent(stats.change_1h)),
+            format_token_data_line("├", "24H", format_optional_percent(stats.change_24h)),
+            format_token_data_line("├", "7D", format_optional_percent(stats.change_7d)),
+            format_token_data_line("├", "30D", format_optional_percent(stats.change_30d)),
+            format_token_data_line("├", "ATH", f"{format_optional_usd(stats.ath)} ({format_optional_percent(stats.ath_change_percent)})"),
+            format_token_data_line("├", "Vol 24H", format_optional_compact_usd(stats.volume_24h)),
+            format_token_data_line("└", "MCap", format_optional_compact_usd(stats.market_cap)),
+        ]
+    )
 
 
 def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
-    lines = ["📊 Market Prices"]
+    lines = ["📊 <b>Market Prices</b>"]
     for index, stats in enumerate(stats_list):
         if index:
             lines.append("")
         lines.extend(
             [
-                f"{stats.asset}: {format_usd_price(stats.price)}",
-                (
-                    f"1h: {format_optional_percent(stats.change_1h)} | "
-                    f"24h: {format_optional_percent(stats.change_24h)} | "
-                    f"7d: {format_optional_percent(stats.change_7d)}"
-                ),
-                (
-                    f"Vol: {format_optional_compact_usd(stats.volume_24h)} | "
-                    f"MCap: {format_optional_compact_usd(stats.market_cap)}"
-                ),
+                f"🔹 <b>{html_escape(stats.asset)}</b>",
+                format_token_data_line("├", "Price", format_usd_price(stats.price)),
+                format_token_data_line("├", "1H", format_optional_percent(stats.change_1h)),
+                format_token_data_line("├", "24H", format_optional_percent(stats.change_24h)),
+                format_token_data_line("├", "7D", format_optional_percent(stats.change_7d)),
+                format_token_data_line("├", "Vol", format_optional_compact_usd(stats.volume_24h)),
+                format_token_data_line("└", "MCap", format_optional_compact_usd(stats.market_cap)),
             ]
         )
     return "\n".join(lines)
@@ -2238,18 +2269,24 @@ def format_mark_percent(value: Decimal) -> str:
 
 def format_gas_estimate(estimate: GasEstimate) -> str:
     lines = [
-        "⛽ Ethereum Gas",
-        f"🐢 Safe: {format_gwei(estimate.safe_gwei)} gwei",
-        f"⚖️ Standard: {format_gwei(estimate.standard_gwei)} gwei",
-        f"🚀 Fast: {format_gwei(estimate.fast_gwei)} gwei",
+        "⛽ <b>Ethereum Gas</b>",
+        format_token_data_line("├", "Safe", f"{format_gwei(estimate.safe_gwei)} gwei"),
+        format_token_data_line("├", "Standard", f"{format_gwei(estimate.standard_gwei)} gwei"),
+        format_token_data_line("├", "Fast", f"{format_gwei(estimate.fast_gwei)} gwei"),
     ]
     if estimate.base_fee_gwei is not None:
-        lines.append(f"Base fee: {format_gwei(estimate.base_fee_gwei)} gwei")
+        lines.append(format_token_data_line("├", "BaseFee", f"{format_gwei(estimate.base_fee_gwei)} gwei"))
     if estimate.gas_used_ratio is not None:
-        lines.append(f"Network use: {format_decimal((estimate.gas_used_ratio * Decimal('100')).quantize(Decimal('0.01')))}%")
+        lines.append(
+            format_token_data_line(
+                "├",
+                "Network",
+                f"{format_decimal((estimate.gas_used_ratio * Decimal('100')).quantize(Decimal('0.01')))}%",
+            )
+        )
     if estimate.last_block:
-        lines.append(f"Block: {estimate.last_block}")
-    lines.append(f"Source: {estimate.source}")
+        lines.append(format_token_data_line("├", "Block", estimate.last_block))
+    lines.append(format_token_data_line("└", "Source", estimate.source))
     return "\n".join(lines)
 
 
@@ -2332,7 +2369,12 @@ def parse_latest_gas_used_ratio(value: Any) -> Decimal | None:
 
 
 def reply_timeframes() -> str:
-    return "Timeframe Binance yang tersedia:\n" + ", ".join(BINANCE_TIMEFRAMES)
+    return "\n".join(
+        [
+            "⏱ <b>Timeframe Binance</b>",
+            f"<code>{html_escape(', '.join(BINANCE_TIMEFRAMES))}</code>",
+        ]
+    )
 
 
 def strip_bot_mention(text: str) -> str:
