@@ -32,6 +32,7 @@ COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api"
 DEXSCREENER_API_BASE = "https://api.dexscreener.com"
 GOPLUS_API_BASE = "https://api.gopluslabs.io/api/v1"
+OPENSEA_API_BASE = "https://api.opensea.io"
 ETH_RPC_URLS = (
     "https://ethereum.publicnode.com",
     "https://rpc.flashbots.net",
@@ -65,6 +66,20 @@ SUPPORTED_TOKEN_CHAINS = {
     "ethereum": {"tag": "ETH", "goplus_chain_id": "1", "gmgn_chain": "eth", "okx_chain": "ethereum"},
     "base": {"tag": "BASE", "goplus_chain_id": "8453", "gmgn_chain": "base", "okx_chain": "base"},
     "bsc": {"tag": "BNB", "goplus_chain_id": "56", "gmgn_chain": "bsc", "okx_chain": "bsc"},
+}
+
+OPENSEA_NATIVE_SYMBOLS = {
+    "ape_chain": "APE",
+    "arbitrum": "ETH",
+    "avalanche": "AVAX",
+    "base": "ETH",
+    "blast": "ETH",
+    "bsc": "BNB",
+    "ethereum": "ETH",
+    "matic": "MATIC",
+    "optimism": "ETH",
+    "polygon": "MATIC",
+    "zora": "ETH",
 }
 
 BINANCE_TIMEFRAMES = (
@@ -161,10 +176,12 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /mp btc sol eth
 /gas
 /ca 0xcontract
+/nft https://opensea.io/collection/slug
 /convert 0.5 btc usd
 /convert 250 doge idr
 0.1 btc
 0xcontract
+https://opensea.io/collection/slug
 /tv eth
 /tv eth 15m
 /kline btc 15m
@@ -358,6 +375,30 @@ class TokenMessageRef:
     chat_id: int
     chain_id: str
     address: str
+
+
+@dataclass
+class OpenSeaLink:
+    url: str
+    slug: str | None = None
+    chain: str | None = None
+    contract: str | None = None
+    token_id: str | None = None
+
+
+@dataclass
+class NFTFloorResult:
+    collection_name: str
+    collection_slug: str
+    chain: str
+    native_symbol: str
+    floor_native: Decimal | None
+    floor_usd: Decimal | None
+    collection_url: str
+    source_url: str
+    nft_name: str | None = None
+    token_id: str | None = None
+    contract: str | None = None
 
 
 class TokenMarkStore:
@@ -562,6 +603,98 @@ class TokenLookupClient:
             holder_count=str(token_data.get("holder_count")) if token_data.get("holder_count") is not None else None,
             lp_holder_count=str(token_data.get("lp_holder_count")) if token_data.get("lp_holder_count") is not None else None,
         )
+
+
+class OpenSeaClient:
+    def __init__(
+        self,
+        api_key: str | None,
+        price_client: "BinanceMarketClient",
+        api_base: str = OPENSEA_API_BASE,
+    ) -> None:
+        self.api_key = api_key.strip() if api_key else None
+        self.price_client = price_client
+        self.api_base = api_base.rstrip("/")
+
+    def get_floor_from_url(self, url: str) -> NFTFloorResult:
+        if not self.api_key:
+            raise BotError("Fitur OpenSea membutuhkan OPENSEA_API_KEY. Isi dulu di file .env.")
+
+        link = parse_opensea_link(url)
+        nft_name = None
+        token_id = link.token_id
+        contract = link.contract
+        chain = link.chain
+        slug = link.slug
+
+        if not slug and chain and contract and token_id:
+            nft_payload = self.get_json(f"/api/v2/chain/{chain}/contract/{contract}/nfts/{urllib.parse.quote(token_id, safe='')}")
+            nft = nft_payload.get("nft") if isinstance(nft_payload, dict) else None
+            if not isinstance(nft, dict):
+                raise BotError("OpenSea tidak mengembalikan data NFT yang valid.")
+            slug = str(nft.get("collection") or "")
+            nft_name = str(nft.get("name") or "") or None
+            if not slug:
+                raise BotError("Collection slug tidak ditemukan dari link NFT OpenSea.")
+
+        if not slug:
+            raise BotError("Link OpenSea tidak dikenali. Pakai link collection atau asset NFT.")
+
+        collection = self.get_collection(slug)
+        stats = self.get_collection_stats(slug)
+        collection_name = str(collection.get("name") or slug)
+        chain = chain or infer_collection_chain(collection) or "ethereum"
+        native_symbol = native_symbol_for_opensea_chain(chain)
+        floor_native = parse_opensea_floor_price(stats)
+        floor_usd = self.floor_to_usd(floor_native, native_symbol)
+
+        return NFTFloorResult(
+            collection_name=collection_name,
+            collection_slug=slug,
+            chain=chain,
+            native_symbol=native_symbol,
+            floor_native=floor_native,
+            floor_usd=floor_usd,
+            collection_url=f"https://opensea.io/collection/{slug}",
+            source_url=link.url,
+            nft_name=nft_name,
+            token_id=token_id,
+            contract=contract,
+        )
+
+    def get_collection(self, slug: str) -> dict[str, Any]:
+        payload = self.get_json(f"/api/v2/collections/{urllib.parse.quote(slug, safe='')}")
+        if not isinstance(payload, dict):
+            raise BotError("OpenSea collection response tidak valid.")
+        collection = payload.get("collection") if isinstance(payload.get("collection"), dict) else payload
+        return collection
+
+    def get_collection_stats(self, slug: str) -> dict[str, Any]:
+        payload = self.get_json(f"/api/v2/collections/{urllib.parse.quote(slug, safe='')}/stats")
+        if not isinstance(payload, dict):
+            raise BotError("OpenSea stats response tidak valid.")
+        return payload
+
+    def get_json(self, path: str) -> Any:
+        try:
+            return generic_get_json(
+                f"{self.api_base}{path}",
+                headers={"X-API-KEY": self.api_key or ""},
+            )
+        except BotError as exc:
+            message = str(exc)
+            if "401" in message:
+                raise BotError("OpenSea API menolak request (401). Cek OPENSEA_API_KEY di .env.") from exc
+            raise
+
+    def floor_to_usd(self, floor_native: Decimal | None, native_symbol: str) -> Decimal | None:
+        if floor_native is None:
+            return None
+        try:
+            price = self.price_client.get_prices(native_symbol.lower(), ("usd",)).prices["usd"]
+        except BotError:
+            return None
+        return floor_native * price
 
 
 class GasClient:
@@ -1224,6 +1357,7 @@ class TelegramBot:
         gas_client: GasClient,
         token_client: TokenLookupClient,
         mark_store: TokenMarkStore,
+        opensea_client: OpenSeaClient,
     ) -> None:
         self.token = token
         self.price_client = price_client
@@ -1231,6 +1365,7 @@ class TelegramBot:
         self.gas_client = gas_client
         self.token_client = token_client
         self.mark_store = mark_store
+        self.opensea_client = opensea_client
         self.offset = load_offset()
         self.token_refresh_times: dict[tuple[int, int], float] = {}
 
@@ -1274,7 +1409,12 @@ class TelegramBot:
 
         if chat_id is None or not text:
             return
-        if not text.startswith("/") and not is_quick_convert_amount_coin(text) and not extract_contract_address(text):
+        if (
+            not text.startswith("/")
+            and not is_quick_convert_amount_coin(text)
+            and not extract_contract_address(text)
+            and not extract_opensea_url(text)
+        ):
             return
 
         try:
@@ -1431,6 +1571,8 @@ class TelegramBot:
             if chat_id is None:
                 raise BotError("Chat id tidak tersedia untuk mark contract.")
             return self.reply_token_lookup(request["address"], chat_id, user_label)
+        if request["kind"] == "nft_floor":
+            return self.reply_nft_floor(request["url"])
 
         raise BotError("Command belum dikenali.")
 
@@ -1485,6 +1627,9 @@ class TelegramBot:
             mark,
             token_ref=TokenMessageRef(chat_id=chat_id, chain_id=snapshot.chain_id, address=snapshot.address),
         )
+
+    def reply_nft_floor(self, url: str) -> TextReply:
+        return build_html_text_reply(format_nft_floor(self.opensea_client.get_floor_from_url(url)))
 
     def send_message(
         self,
@@ -1573,6 +1718,18 @@ def parse_user_request(text: str) -> dict[str, Any]:
 
     parts = clean.split()
     first = parts[0].split("@", 1)[0].lower() if parts else ""
+
+    opensea_url = extract_opensea_url(clean)
+    if opensea_url and not first.startswith("/"):
+        return {"kind": "nft_floor", "url": opensea_url}
+
+    if first in {"/nft", "/floor"}:
+        if len(parts) < 2:
+            raise BotError("Format: /nft https://opensea.io/collection/slug")
+        opensea_url = extract_opensea_url(parts[1])
+        if not opensea_url:
+            raise BotError("Link OpenSea tidak valid.")
+        return {"kind": "nft_floor", "url": opensea_url}
 
     contract_address = extract_contract_address(clean)
     if contract_address and not first.startswith("/"):
@@ -1731,6 +1888,59 @@ def is_quick_convert_amount_coin(text: str) -> bool:
 def extract_contract_address(text: str) -> str | None:
     match = re.search(r"0x[a-fA-F0-9]{40}", text)
     return match.group(0) if match else None
+
+
+def extract_opensea_url(text: str) -> str | None:
+    match = re.search(r"https?://(?:www\.)?opensea\.io/[^\s<>]+", text, flags=re.IGNORECASE)
+    return match.group(0).rstrip(").,]") if match else None
+
+
+def parse_opensea_link(url: str) -> OpenSeaLink:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.netloc.lower()
+    if host not in {"opensea.io", "www.opensea.io"}:
+        raise BotError("Link OpenSea tidak valid.")
+
+    segments = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+    if len(segments) >= 2 and segments[0].lower() == "collection":
+        return OpenSeaLink(url=url, slug=segments[1])
+
+    if len(segments) >= 3 and segments[0].lower() in {"assets", "item"}:
+        if re.fullmatch(r"0x[a-fA-F0-9]{40}", segments[1]):
+            chain = "ethereum"
+            contract = segments[1]
+            token_id = segments[2]
+        elif len(segments) >= 4:
+            chain = normalize_opensea_chain(segments[1])
+            contract = segments[2]
+            token_id = segments[3]
+        else:
+            raise BotError("Link NFT OpenSea tidak lengkap.")
+
+        if not re.fullmatch(r"0x[a-fA-F0-9]{40}", contract):
+            raise BotError("Contract address di link OpenSea tidak valid.")
+        return OpenSeaLink(url=url, chain=chain, contract=contract, token_id=token_id)
+
+    raise BotError("Link OpenSea tidak dikenali. Pakai link collection atau asset NFT.")
+
+
+def normalize_opensea_chain(chain: str) -> str:
+    normalized = chain.lower().strip()
+    aliases = {
+        "eth": "ethereum",
+        "ethereum": "ethereum",
+        "matic": "polygon",
+        "polygon": "polygon",
+        "base": "base",
+        "arbitrum": "arbitrum",
+        "optimism": "optimism",
+        "avalanche": "avalanche",
+        "avax": "avalanche",
+        "bsc": "bsc",
+        "bnb": "bsc",
+        "zora": "zora",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def normalize_contract_address(address: str) -> str:
@@ -1986,6 +2196,38 @@ def format_multi_market_stats(stats_list: list[MarketStats]) -> str:
     return "\n".join(lines)
 
 
+def format_nft_floor(result: NFTFloorResult) -> str:
+    title = result.collection_name
+    if result.nft_name:
+        title = f"{title} · {result.nft_name}"
+
+    lines = [
+        f"🖼 <b>{html_escape(title)}</b>",
+        format_token_data_line("├", "Floor", format_nft_native_floor(result.floor_native, result.native_symbol)),
+        format_token_data_line("├", "USD", format_optional_usd(result.floor_usd)),
+        format_token_data_line("├", "Chain", format_opensea_chain_label(result.chain)),
+        format_token_data_line("├", "Slug", result.collection_slug),
+    ]
+    if result.token_id:
+        lines.append(format_token_data_line("├", "Token", result.token_id))
+    if result.contract:
+        lines.append(format_token_data_line("├", "Contract", short_address(result.contract)))
+    lines.extend(
+        [
+            format_token_data_line("└", "Source", "OpenSea"),
+            "",
+            format_html_link("OpenSea", result.collection_url),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def format_nft_native_floor(value: Decimal | None, symbol: str) -> str:
+    if value is None:
+        return "N/A"
+    return f"{format_asset_amount(value)} {symbol}"
+
+
 def build_token_text_reply(
     snapshot: TokenSnapshot,
     mark: TokenMark,
@@ -2174,6 +2416,50 @@ def normalize_website_label(label: str) -> str:
     if not normalized or normalized.lower() in {"website", "site", "homepage"}:
         return "Web"
     return normalized[:12]
+
+
+def infer_collection_chain(collection: dict[str, Any]) -> str | None:
+    contracts = collection.get("contracts")
+    if not isinstance(contracts, list):
+        return None
+    for contract in contracts:
+        if isinstance(contract, dict) and isinstance(contract.get("chain"), str):
+            return normalize_opensea_chain(contract["chain"])
+    return None
+
+
+def parse_opensea_floor_price(stats: dict[str, Any]) -> Decimal | None:
+    total = stats.get("total") if isinstance(stats.get("total"), dict) else {}
+    candidates = [
+        decimal_from_path(stats, ("total", "floor_price")),
+        decimal_from_path(stats, ("stats", "total", "floor_price")),
+        decimal_from_path(stats, ("stats", "floor_price")),
+        decimal_from_any(stats.get("floor_price")),
+        decimal_from_any(total.get("floor_price")),
+    ]
+    for candidate in candidates:
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def native_symbol_for_opensea_chain(chain: str) -> str:
+    return OPENSEA_NATIVE_SYMBOLS.get(normalize_opensea_chain(chain), "ETH")
+
+
+def format_opensea_chain_label(chain: str) -> str:
+    labels = {
+        "arbitrum": "Arbitrum",
+        "avalanche": "Avalanche",
+        "base": "Base",
+        "bsc": "BNB Chain",
+        "ethereum": "Ethereum",
+        "matic": "Polygon",
+        "optimism": "Optimism",
+        "polygon": "Polygon",
+        "zora": "Zora",
+    }
+    return labels.get(normalize_opensea_chain(chain), chain)
 
 
 def format_html_link(label: str, url: str) -> str:
@@ -2384,15 +2670,21 @@ def strip_bot_mention(text: str) -> str:
     return " ".join([first_word, *rest]).strip()
 
 
-def generic_get_json(url: str, params: dict[str, Any] | None = None) -> Any:
+def generic_get_json(
+    url: str,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> Any:
     query = urllib.parse.urlencode(params or {})
     full_url = f"{url}?{query}" if query else url
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": "crypto-telegram-converter/2.0",
+    }
+    request_headers.update(headers or {})
     request = urllib.request.Request(
         full_url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "crypto-telegram-converter/2.0",
-        },
+        headers=request_headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
@@ -2684,9 +2976,10 @@ def main() -> int:
     api_bases = parse_api_bases(os.environ.get("BINANCE_API_BASES") or os.environ.get("BINANCE_API_BASE"))
     coingecko_api_base = os.environ.get("COINGECKO_API_BASE", COINGECKO_API_BASE)
     eth_rpc_urls = parse_url_list(os.environ.get("ETH_RPC_URLS"), ETH_RPC_URLS)
+    price_client = BinanceMarketClient(api_bases=api_bases)
     bot = TelegramBot(
         token=token,
-        price_client=BinanceMarketClient(api_bases=api_bases),
+        price_client=price_client,
         stats_client=MarketStatsClient(api_base=coingecko_api_base),
         gas_client=GasClient(
             etherscan_api_key=os.environ.get("ETHERSCAN_API_KEY"),
@@ -2694,6 +2987,11 @@ def main() -> int:
         ),
         token_client=TokenLookupClient(),
         mark_store=TokenMarkStore(),
+        opensea_client=OpenSeaClient(
+            api_key=os.environ.get("OPENSEA_API_KEY"),
+            price_client=price_client,
+            api_base=os.environ.get("OPENSEA_API_BASE", OPENSEA_API_BASE),
+        ),
     )
     bot.run_forever()
     return 0

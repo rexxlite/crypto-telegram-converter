@@ -10,6 +10,8 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/mp btc sol eth` menampilkan ringkasan harga beberapa coin sekaligus.
 - `/gas` menampilkan gas Ethereum realtime dalam gwei.
 - `/ca 0xcontract` menampilkan data token dari contract address ETH, Base, atau BNB Chain.
+- `/nft https://opensea.io/collection/slug` menampilkan floor price NFT OpenSea dalam native coin dan USD.
+- Link OpenSea yang dipaste langsung juga otomatis dibaca untuk floor price NFT.
 - Info token punya tombol hapus, refresh data, dan buka DEX langsung dari bawah pesan.
 - Template teks seperti `/p`, `/mp`, `/gas`, `/price`, `/convert`, dan `/kline` memakai format HTML yang rapi seperti scan token.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
@@ -44,6 +46,12 @@ ETHERSCAN_API_KEY=isi_api_key_etherscan
 ETH_RPC_URLS=https://ethereum.publicnode.com,https://rpc.flashbots.net,https://cloudflare-eth.com
 ```
 
+Untuk fitur floor price NFT OpenSea, isi API key OpenSea:
+
+```env
+OPENSEA_API_KEY=isi_api_key_opensea
+```
+
 4. Install dependency chart:
 
 ```bash
@@ -74,6 +82,7 @@ python3 bot.py
 - Command `/p` memakai CoinGecko untuk data market lengkap seperti ATH, market cap, volume, dan perubahan 7d/30d.
 - Command `/gas` memakai Etherscan Gas Oracle jika `ETHERSCAN_API_KEY` diisi, lalu fallback ke public Ethereum RPC `eth_feeHistory`.
 - Contract address lookup memakai DexScreener untuk data token/pair dan GoPlus Labs untuk data security best-effort.
+- Floor NFT memakai OpenSea API v2. Link collection dan asset NFT OpenSea didukung.
 - Mark contract pertama per grup disimpan lokal di `.token_marks.json`, berisi user pertama yang paste, waktu pertama, dan market cap pertama.
 - Waktu mark token seperti `(1h)` menjadi link ke pesan scan pertama jika message id pertama sudah terekam.
 - Tombol refresh info token hanya bisa dipakai setiap 5 detik per pesan agar API tidak kena spam.
