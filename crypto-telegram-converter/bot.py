@@ -401,6 +401,10 @@ class NFTFloorResult:
     native_symbol: str
     floor_native: Decimal | None
     floor_usd: Decimal | None
+    change_1h: Decimal | None
+    change_24h: Decimal | None
+    owners: int | None
+    total_supply: int | None
     collection_url: str
     source_url: str
     nft_name: str | None = None
@@ -657,9 +661,13 @@ class OpenSeaClient:
         stats = self.get_collection_stats(slug)
         collection_name = str(collection.get("name") or slug)
         chain = chain or infer_collection_chain(collection) or "ethereum"
-        native_symbol = native_symbol_for_opensea_chain(chain)
+        native_symbol = parse_opensea_floor_symbol(stats) or native_symbol_for_opensea_chain(chain)
         floor_native = parse_opensea_floor_price(stats)
         floor_usd = self.floor_to_usd(floor_native, native_symbol)
+        change_1h = parse_opensea_change(stats, "one_hour")
+        change_24h = parse_opensea_change(stats, "one_day")
+        owners = parse_opensea_count(stats, collection, ("num_owners", "owners", "owner_count"))
+        total_supply = parse_opensea_count(stats, collection, ("total_supply", "count", "supply"))
 
         if original_slug and original_slug != slug:
             remember_opensea_alias(original_slug, slug)
@@ -671,6 +679,10 @@ class OpenSeaClient:
             native_symbol=native_symbol,
             floor_native=floor_native,
             floor_usd=floor_usd,
+            change_1h=change_1h,
+            change_24h=change_24h,
+            owners=owners,
+            total_supply=total_supply,
             collection_url=f"https://opensea.io/collection/{slug}",
             source_url=link.url,
             nft_name=nft_name,
@@ -2441,6 +2453,10 @@ def format_nft_floor(result: NFTFloorResult) -> str:
         f"🖼 <b>{html_escape(title)}</b>",
         format_token_data_line("├", "Floor", format_nft_native_floor(result.floor_native, result.native_symbol)),
         format_token_data_line("├", "USD", format_optional_usd(result.floor_usd)),
+        format_token_data_line("├", "1H", format_optional_percent(result.change_1h)),
+        format_token_data_line("├", "24H", format_optional_percent(result.change_24h)),
+        format_token_data_line("├", "Owners", format_optional_count(result.owners)),
+        format_token_data_line("├", "Supply", format_optional_count(result.total_supply)),
         format_token_data_line("├", "Chain", format_opensea_chain_label(result.chain)),
         format_token_data_line("├", "Slug", result.collection_slug),
     ]
@@ -2677,6 +2693,80 @@ def parse_opensea_floor_price(stats: dict[str, Any]) -> Decimal | None:
         if candidate is not None:
             return candidate
     return None
+
+
+def parse_opensea_floor_symbol(stats: dict[str, Any]) -> str | None:
+    for container in opensea_stats_containers(stats, {}):
+        value = container.get("floor_price_symbol")
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+    return None
+
+
+def parse_opensea_change(stats: dict[str, Any], interval: str) -> Decimal | None:
+    legacy_keys = {
+        "one_hour": ("one_hour_change", "one_hour_floor_price_change", "1h_change", "hour_change"),
+        "one_day": ("one_day_change", "one_day_floor_price_change", "24h_change", "day_change"),
+    }.get(interval, (f"{interval}_change",))
+
+    for container in opensea_stats_containers(stats, {}):
+        for key in legacy_keys:
+            change = percent_decimal_from_ratio(container.get(key))
+            if change is not None:
+                return change
+
+    interval_stats = find_opensea_interval_stats(stats, interval)
+    if not interval_stats:
+        return None
+
+    for key in ("floor_price_change", "floor_change", "price_change", "change", "volume_change"):
+        change = percent_decimal_from_ratio(interval_stats.get(key))
+        if change is not None:
+            return change
+    return None
+
+
+def find_opensea_interval_stats(stats: dict[str, Any], interval: str) -> dict[str, Any] | None:
+    aliases = {
+        "one_hour": {"one_hour", "one-hour", "hour", "1h"},
+        "one_day": {"one_day", "one-day", "day", "1d", "24h"},
+    }.get(interval, {interval})
+
+    for container in opensea_stats_containers(stats, {}):
+        intervals = container.get("intervals")
+        if not isinstance(intervals, list):
+            continue
+        for item in intervals:
+            if not isinstance(item, dict):
+                continue
+            item_interval = str(item.get("interval") or "").lower()
+            if item_interval in aliases:
+                return item
+    return None
+
+
+def parse_opensea_count(stats: dict[str, Any], collection: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for container in opensea_stats_containers(stats, collection):
+        for key in keys:
+            number = decimal_from_any(container.get(key))
+            if number is not None:
+                return int(number)
+    return None
+
+
+def opensea_stats_containers(stats: dict[str, Any], collection: dict[str, Any]) -> list[dict[str, Any]]:
+    containers: list[dict[str, Any]] = []
+    for candidate in (
+        stats.get("total"),
+        stats.get("stats", {}).get("total") if isinstance(stats.get("stats"), dict) else None,
+        stats.get("stats"),
+        stats,
+        collection.get("stats"),
+        collection,
+    ):
+        if isinstance(candidate, dict) and candidate not in containers:
+            containers.append(candidate)
+    return containers
 
 
 def native_symbol_for_opensea_chain(chain: str) -> str:
@@ -3113,6 +3203,10 @@ def format_optional_percent(value: Decimal | None) -> str:
     if value is None:
         return "N/A"
     return f"{format_decimal(value.quantize(Decimal('0.01')))}%"
+
+
+def format_optional_count(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "N/A"
 
 
 def format_optional_compact_usd(value: Decimal | None) -> str:
