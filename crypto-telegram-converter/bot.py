@@ -60,7 +60,9 @@ WEI_PER_GWEI = Decimal("1000000000")
 TOKEN_MARKS_PATH = os.path.join(BASE_DIR, ".token_marks.json")
 OPENSEA_ALIASES_PATH = os.path.join(BASE_DIR, ".opensea_aliases.json")
 TOKEN_REFRESH_COOLDOWN_SECONDS = 5
+NFT_REFRESH_COOLDOWN_SECONDS = 10
 TOKEN_CALLBACK_PREFIX = "tok"
+NFT_CALLBACK_PREFIX = "nft"
 GMGN_REFERRAL_ID = "30I510nA"
 
 SUPPORTED_TOKEN_CHAINS = {
@@ -1431,6 +1433,7 @@ class TelegramBot:
         self.opensea_client = opensea_client
         self.offset = load_offset()
         self.token_refresh_times: dict[tuple[int, int], float] = {}
+        self.nft_refresh_times: dict[tuple[int, int], float] = {}
 
     def run_forever(self) -> None:
         print("Bot aktif. Tekan Ctrl+C untuk berhenti.")
@@ -1534,7 +1537,12 @@ class TelegramBot:
     def handle_callback_query(self, callback_query: dict[str, Any]) -> None:
         callback_id = str(callback_query.get("id") or "")
         try:
-            callback = parse_token_callback_data(str(callback_query.get("data") or ""))
+            data = str(callback_query.get("data") or "")
+            if data.startswith(f"{NFT_CALLBACK_PREFIX}|"):
+                self.handle_nft_callback_query(callback_query)
+                return
+
+            callback = parse_token_callback_data(data)
             message = callback_query.get("message") if isinstance(callback_query.get("message"), dict) else {}
             chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
             chat_id = chat.get("id")
@@ -1556,6 +1564,65 @@ class TelegramBot:
         except BotError as exc:
             if callback_id:
                 self.answer_callback_query(callback_id, str(exc), show_alert=True)
+
+    def handle_nft_callback_query(self, callback_query: dict[str, Any]) -> None:
+        callback = parse_nft_callback_data(str(callback_query.get("data") or ""))
+        message = callback_query.get("message") if isinstance(callback_query.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        chat_id = chat.get("id")
+        message_id = message.get("message_id")
+        if chat_id is None or message_id is None:
+            raise BotError("Pesan NFT tidak ditemukan.")
+
+        if callback["action"] == "r":
+            self.refresh_nft_message(callback_query, callback, int(chat_id), int(message_id), message)
+            return
+
+        raise BotError("Action tombol NFT tidak dikenal.")
+
+    def refresh_nft_message(
+        self,
+        callback_query: dict[str, Any],
+        callback: dict[str, str | None],
+        chat_id: int,
+        message_id: int,
+        message: dict[str, Any],
+    ) -> None:
+        callback_id = str(callback_query.get("id") or "")
+        now = time.time()
+        refresh_key = (chat_id, message_id)
+        last_refresh = self.nft_refresh_times.get(refresh_key)
+        if last_refresh is None:
+            last_refresh = float(message.get("edit_date") or message.get("date") or 0)
+
+        remaining = NFT_REFRESH_COOLDOWN_SECONDS - (now - last_refresh)
+        if remaining > 0:
+            wait_seconds = int(remaining) + 1
+            self.answer_callback_query(callback_id, f"Tunggu {wait_seconds} detik sebelum refresh NFT.")
+            return
+
+        reference = callback.get("reference") or extract_nft_reference_from_message(message)
+        if not reference:
+            raise BotError("Slug NFT tidak ditemukan untuk refresh.")
+
+        reply = build_nft_text_reply(self.opensea_client.get_floor_from_reference(reference))
+        try:
+            self.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=reply.text,
+                parse_mode=reply.parse_mode,
+                reply_markup=reply.reply_markup,
+            )
+        except BotError as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+            self.nft_refresh_times[refresh_key] = now
+            self.answer_callback_query(callback_id, "Data NFT masih sama.")
+            return
+
+        self.nft_refresh_times[refresh_key] = now
+        self.answer_callback_query(callback_id, "Data NFT diperbarui.")
 
     def refresh_token_message(
         self,
@@ -1693,7 +1760,7 @@ class TelegramBot:
         )
 
     def reply_nft_floor(self, url: str) -> TextReply:
-        return build_html_text_reply(format_nft_floor(self.opensea_client.get_floor_from_url(url)))
+        return build_nft_text_reply(self.opensea_client.get_floor_from_url(url))
 
     def send_message(
         self,
@@ -1913,6 +1980,22 @@ def parse_token_callback_data(data: str) -> dict[str, str]:
     }
 
 
+def parse_nft_callback_data(data: str) -> dict[str, str | None]:
+    parts = data.split("|", 2)
+    if len(parts) < 2 or parts[0] != NFT_CALLBACK_PREFIX:
+        raise BotError("Tombol NFT ini tidak valid.")
+
+    action = parts[1]
+    if action != "r":
+        raise BotError("Action tombol NFT tidak valid.")
+
+    reference = normalize_opensea_collection_query(parts[2]) if len(parts) == 3 else None
+    return {
+        "action": action,
+        "reference": reference or None,
+    }
+
+
 def normalize_currency(currency: str | None) -> str:
     if not currency:
         raise BotError("Target mata uang belum diisi. Pilih USD, USDT, atau IDR.")
@@ -1962,6 +2045,30 @@ def extract_contract_address(text: str) -> str | None:
 def extract_opensea_url(text: str) -> str | None:
     match = re.search(r"https?://(?:www\.)?opensea\.io/[^\s<>]+", text, flags=re.IGNORECASE)
     return match.group(0).rstrip(").,]") if match else None
+
+
+def extract_nft_reference_from_message(message: dict[str, Any]) -> str | None:
+    text = str(message.get("text") or message.get("caption") or "")
+    slug_match = re.search(r"Slug:\s*([^\n]+)", text, flags=re.IGNORECASE)
+    if slug_match:
+        slug = normalize_opensea_collection_query(slug_match.group(1))
+        if slug:
+            return slug
+
+    for entity_key in ("entities", "caption_entities"):
+        entities = message.get(entity_key)
+        if not isinstance(entities, list):
+            continue
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            url = entity.get("url")
+            if isinstance(url, str):
+                opensea_url = extract_opensea_url(url)
+                if opensea_url:
+                    return opensea_url
+
+    return extract_opensea_url(text)
 
 
 def parse_opensea_link(url: str) -> OpenSeaLink:
@@ -2478,6 +2585,37 @@ def format_nft_native_floor(value: Decimal | None, symbol: str) -> str:
     if value is None:
         return "N/A"
     return f"{format_asset_amount(value)} {symbol}"
+
+
+def build_nft_text_reply(result: NFTFloorResult) -> TextReply:
+    return TextReply(
+        text=format_nft_floor(result),
+        parse_mode="HTML",
+        reply_markup=build_nft_reply_markup(result),
+    )
+
+
+def build_nft_reply_markup(result: NFTFloorResult) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "↻", "callback_data": nft_callback_data("r", result.collection_slug)},
+                {"text": "OpenSea ↗", "url": result.collection_url},
+            ],
+        ],
+    }
+
+
+def nft_callback_data(action: str, reference: str | None = None) -> str:
+    base = f"{NFT_CALLBACK_PREFIX}|{action}"
+    if not reference:
+        return base
+
+    normalized = normalize_opensea_collection_query(reference)
+    candidate = f"{base}|{normalized}"
+    if len(candidate.encode("utf-8")) <= 64:
+        return candidate
+    return base
 
 
 def build_token_text_reply(
