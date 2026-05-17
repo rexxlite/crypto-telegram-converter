@@ -11,7 +11,9 @@ Bot Telegram sederhana untuk cek harga crypto, konversi, dan candle timeframe se
 - `/gas` menampilkan gas Ethereum realtime dalam gwei.
 - `/ca 0xcontract` menampilkan data token dari contract address ETH, Base, atau BNB Chain.
 - `/nft https://opensea.io/collection/slug` menampilkan floor price NFT OpenSea dalam native coin dan USD.
+- `/nft axi-eternals` atau `nft axi-eternals` mencari collection OpenSea dari nama/slug pendek.
 - Link OpenSea yang dipaste langsung juga otomatis dibaca untuk floor price NFT.
+- Alias yang sudah dikenal, misalnya `axi-eternals`, bisa dikirim langsung tanpa `/nft`.
 - Info token punya tombol hapus, refresh data, dan buka DEX langsung dari bawah pesan.
 - Template teks seperti `/p`, `/mp`, `/gas`, `/price`, `/convert`, dan `/kline` memakai format HTML yang rapi seperti scan token.
 - `/convert 0.5 btc usd` mengonversi jumlah coin ke USD.
@@ -52,6 +54,12 @@ Untuk fitur floor price NFT OpenSea, isi API key OpenSea:
 OPENSEA_API_KEY=isi_api_key_opensea
 ```
 
+Opsional, kamu bisa tambah alias collection OpenSea sendiri. Ini berguna kalau slug OpenSea punya angka panjang, tapi kamu ingin user cukup kirim nama pendek:
+
+```env
+OPENSEA_COLLECTION_ALIASES=axi-eternals=axi-eternals-616633974
+```
+
 4. Install dependency chart:
 
 ```bash
@@ -77,12 +85,13 @@ python3 bot.py
 ## Catatan
 
 - Bot ini memakai long polling, jadi cocok untuk dijalankan di laptop/VPS tanpa setup webhook.
-- Bot hanya merespons command yang diawali `/`, pola konversi cepat seperti `0.1 btc`, dan contract address EVM `0x...`; pesan biasa di private chat atau grup akan diabaikan.
+- Bot hanya merespons command yang diawali `/`, pola konversi cepat seperti `0.1 btc`, contract address EVM `0x...`, link OpenSea, dan alias NFT OpenSea yang sudah dikenal; pesan biasa di private chat atau grup akan diabaikan.
 - Harga dan candle berasal dari Binance Spot public API dan bisa berubah cepat. Public API punya rate limit, jadi hindari spam request terlalu banyak.
 - Command `/p` memakai CoinGecko untuk data market lengkap seperti ATH, market cap, volume, dan perubahan 7d/30d.
 - Command `/gas` memakai Etherscan Gas Oracle jika `ETHERSCAN_API_KEY` diisi, lalu fallback ke public Ethereum RPC `eth_feeHistory`.
 - Contract address lookup memakai DexScreener untuk data token/pair dan GoPlus Labs untuk data security best-effort.
-- Floor NFT memakai OpenSea API v2. Link collection dan asset NFT OpenSea didukung.
+- Floor NFT memakai OpenSea API v2. Link collection, asset NFT, `/nft nama`, `nft nama`, dan alias nama pendek OpenSea didukung.
+- Alias OpenSea default saat ini mencakup `axi-eternals` ke `axi-eternals-616633974`. Bot juga menyimpan alias lokal di `.opensea_aliases.json` saat berhasil mengenali slug yang punya suffix angka.
 - Mark contract pertama per grup disimpan lokal di `.token_marks.json`, berisi user pertama yang paste, waktu pertama, dan market cap pertama.
 - Waktu mark token seperti `(1h)` menjadi link ke pesan scan pertama jika message id pertama sudah terekam.
 - Tombol refresh info token hanya bisa dipakai setiap 5 detik per pesan agar API tidak kena spam.

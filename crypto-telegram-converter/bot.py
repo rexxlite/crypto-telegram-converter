@@ -58,6 +58,7 @@ GAS_CACHE_SECONDS = 15
 CHART_CANDLE_LIMIT = 134
 WEI_PER_GWEI = Decimal("1000000000")
 TOKEN_MARKS_PATH = os.path.join(BASE_DIR, ".token_marks.json")
+OPENSEA_ALIASES_PATH = os.path.join(BASE_DIR, ".opensea_aliases.json")
 TOKEN_REFRESH_COOLDOWN_SECONDS = 5
 TOKEN_CALLBACK_PREFIX = "tok"
 GMGN_REFERRAL_ID = "30I510nA"
@@ -80,6 +81,10 @@ OPENSEA_NATIVE_SYMBOLS = {
     "optimism": "ETH",
     "polygon": "MATIC",
     "zora": "ETH",
+}
+
+DEFAULT_OPENSEA_ALIASES = {
+    "axi-eternals": "axi-eternals-616633974",
 }
 
 BINANCE_TIMEFRAMES = (
@@ -177,11 +182,13 @@ HELP_TEXT = f"""Halo! Kirim command seperti ini:
 /gas
 /ca 0xcontract
 /nft https://opensea.io/collection/slug
+/nft axi-eternals
 /convert 0.5 btc usd
 /convert 250 doge idr
 0.1 btc
 0xcontract
 https://opensea.io/collection/slug
+axi-eternals
 /tv eth
 /tv eth 15m
 /kline btc 15m
@@ -617,15 +624,19 @@ class OpenSeaClient:
         self.api_base = api_base.rstrip("/")
 
     def get_floor_from_url(self, url: str) -> NFTFloorResult:
+        return self.get_floor_from_reference(url)
+
+    def get_floor_from_reference(self, reference: str) -> NFTFloorResult:
         if not self.api_key:
             raise BotError("Fitur OpenSea membutuhkan OPENSEA_API_KEY. Isi dulu di file .env.")
 
-        link = parse_opensea_link(url)
+        link = parse_opensea_reference(reference)
         nft_name = None
         token_id = link.token_id
         contract = link.contract
         chain = link.chain
         slug = link.slug
+        original_slug = slug
 
         if not slug and chain and contract and token_id:
             nft_payload = self.get_json(f"/api/v2/chain/{chain}/contract/{contract}/nfts/{urllib.parse.quote(token_id, safe='')}")
@@ -638,7 +649,9 @@ class OpenSeaClient:
                 raise BotError("Collection slug tidak ditemukan dari link NFT OpenSea.")
 
         if not slug:
-            raise BotError("Link OpenSea tidak dikenali. Pakai link collection atau asset NFT.")
+            raise BotError("Nama atau link OpenSea tidak dikenali.")
+
+        slug = self.resolve_collection_slug(slug)
 
         collection = self.get_collection(slug)
         stats = self.get_collection_stats(slug)
@@ -647,6 +660,9 @@ class OpenSeaClient:
         native_symbol = native_symbol_for_opensea_chain(chain)
         floor_native = parse_opensea_floor_price(stats)
         floor_usd = self.floor_to_usd(floor_native, native_symbol)
+
+        if original_slug and original_slug != slug:
+            remember_opensea_alias(original_slug, slug)
 
         return NFTFloorResult(
             collection_name=collection_name,
@@ -662,6 +678,40 @@ class OpenSeaClient:
             contract=contract,
         )
 
+    def resolve_collection_slug(self, query: str) -> str:
+        normalized = normalize_opensea_collection_query(query)
+        aliases = load_opensea_aliases()
+        alias = aliases.get(normalized)
+        if alias:
+            return alias
+
+        try:
+            self.get_collection(normalized)
+            remember_opensea_alias(strip_numeric_slug_suffix(normalized), normalized)
+            return normalized
+        except BotError as exc:
+            if not is_not_found_error(exc):
+                raise
+
+        slug = self.search_collection_slug(normalized)
+        if slug:
+            remember_opensea_alias(normalized, slug)
+            remember_opensea_alias(strip_numeric_slug_suffix(slug), slug)
+            return slug
+
+        raise BotError(f"Collection OpenSea '{query}' tidak ditemukan.")
+
+    def search_collection_slug(self, query: str) -> str | None:
+        payload = self.get_json(
+            "/api/v2/search",
+            {
+                "query": query.replace("-", " "),
+                "asset_types": ["collection"],
+                "limit": "10",
+            },
+        )
+        return find_best_opensea_collection_slug(payload, query)
+
     def get_collection(self, slug: str) -> dict[str, Any]:
         payload = self.get_json(f"/api/v2/collections/{urllib.parse.quote(slug, safe='')}")
         if not isinstance(payload, dict):
@@ -675,10 +725,11 @@ class OpenSeaClient:
             raise BotError("OpenSea stats response tidak valid.")
         return payload
 
-    def get_json(self, path: str) -> Any:
+    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         try:
             return generic_get_json(
                 f"{self.api_base}{path}",
+                params=params,
                 headers={"X-API-KEY": self.api_key or ""},
             )
         except BotError as exc:
@@ -1414,6 +1465,7 @@ class TelegramBot:
             and not is_quick_convert_amount_coin(text)
             and not extract_contract_address(text)
             and not extract_opensea_url(text)
+            and not is_nft_name_message(text)
         ):
             return
 
@@ -1725,11 +1777,16 @@ def parse_user_request(text: str) -> dict[str, Any]:
 
     if first in {"/nft", "/floor"}:
         if len(parts) < 2:
-            raise BotError("Format: /nft https://opensea.io/collection/slug")
+            raise BotError("Format: /nft axi-eternals atau /nft https://opensea.io/collection/slug")
         opensea_url = extract_opensea_url(parts[1])
-        if not opensea_url:
-            raise BotError("Link OpenSea tidak valid.")
-        return {"kind": "nft_floor", "url": opensea_url}
+        return {"kind": "nft_floor", "url": opensea_url or " ".join(parts[1:])}
+
+    if first in {"nft", "floor"} and len(parts) >= 2:
+        opensea_url = extract_opensea_url(parts[1])
+        return {"kind": "nft_floor", "url": opensea_url or " ".join(parts[1:])}
+
+    if len(parts) == 1 and is_known_opensea_alias(clean):
+        return {"kind": "nft_floor", "url": clean}
 
     contract_address = extract_contract_address(clean)
     if contract_address and not first.startswith("/"):
@@ -1922,6 +1979,185 @@ def parse_opensea_link(url: str) -> OpenSeaLink:
         return OpenSeaLink(url=url, chain=chain, contract=contract, token_id=token_id)
 
     raise BotError("Link OpenSea tidak dikenali. Pakai link collection atau asset NFT.")
+
+
+def parse_opensea_reference(reference: str) -> OpenSeaLink:
+    opensea_url = extract_opensea_url(reference)
+    if opensea_url:
+        return parse_opensea_link(opensea_url)
+
+    slug = normalize_opensea_collection_query(reference)
+    if not slug:
+        raise BotError("Nama collection OpenSea tidak valid.")
+
+    return OpenSeaLink(url=f"https://opensea.io/collection/{urllib.parse.quote(slug)}", slug=slug)
+
+
+def normalize_opensea_collection_query(query: str) -> str:
+    normalized = urllib.parse.unquote(query.strip().lower())
+    normalized = re.sub(r"^https?://(?:www\.)?opensea\.io/collection/", "", normalized)
+    normalized = normalized.strip().strip("/").strip("<>()[]{}\"'")
+    normalized = normalized.replace("_", "-")
+    normalized = re.sub(r"[^a-z0-9 -]+", "", normalized)
+    normalized = re.sub(r"\s+", "-", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized)
+    return normalized.strip("-")
+
+
+def strip_numeric_slug_suffix(slug: str) -> str:
+    normalized = normalize_opensea_collection_query(slug)
+    return re.sub(r"-\d{3,}$", "", normalized)
+
+
+def load_opensea_aliases() -> dict[str, str]:
+    aliases = dict(DEFAULT_OPENSEA_ALIASES)
+    aliases.update(read_opensea_alias_file())
+    aliases.update(parse_opensea_aliases_env(os.environ.get("OPENSEA_COLLECTION_ALIASES")))
+    return aliases
+
+
+def read_opensea_alias_file() -> dict[str, str]:
+    if not os.path.exists(OPENSEA_ALIASES_PATH):
+        return {}
+    try:
+        with open(OPENSEA_ALIASES_PATH, "r", encoding="utf-8") as aliases_file:
+            data = json.load(aliases_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    aliases: dict[str, str] = {}
+    for alias, slug in data.items():
+        normalized_alias = normalize_opensea_collection_query(str(alias))
+        normalized_slug = normalize_opensea_collection_query(str(slug))
+        if normalized_alias and normalized_slug:
+            aliases[normalized_alias] = normalized_slug
+    return aliases
+
+
+def parse_opensea_aliases_env(raw_aliases: str | None) -> dict[str, str]:
+    if not raw_aliases:
+        return {}
+
+    aliases: dict[str, str] = {}
+    for item in raw_aliases.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        separator = "=" if "=" in item else ":"
+        if separator not in item:
+            continue
+        alias, slug = item.split(separator, 1)
+        normalized_alias = normalize_opensea_collection_query(alias)
+        normalized_slug = normalize_opensea_collection_query(slug)
+        if normalized_alias and normalized_slug:
+            aliases[normalized_alias] = normalized_slug
+    return aliases
+
+
+def remember_opensea_alias(alias: str, slug: str) -> None:
+    normalized_alias = normalize_opensea_collection_query(alias)
+    normalized_slug = normalize_opensea_collection_query(slug)
+    if not normalized_alias or not normalized_slug or normalized_alias == normalized_slug:
+        return
+
+    aliases = read_opensea_alias_file()
+    if aliases.get(normalized_alias) == normalized_slug:
+        return
+
+    aliases[normalized_alias] = normalized_slug
+    try:
+        with open(OPENSEA_ALIASES_PATH, "w", encoding="utf-8") as aliases_file:
+            json.dump(aliases, aliases_file, ensure_ascii=False, indent=2, sort_keys=True)
+    except OSError:
+        return
+
+
+def is_known_opensea_alias(text: str) -> bool:
+    alias = normalize_opensea_collection_query(text)
+    return bool(alias and alias in load_opensea_aliases())
+
+
+def is_nft_name_message(text: str) -> bool:
+    clean = text.strip()
+    lower = clean.lower()
+    if lower.startswith(("nft ", "floor ")):
+        return True
+    if extract_opensea_url(clean):
+        return True
+    return len(clean.split()) == 1 and is_known_opensea_alias(clean)
+
+
+def is_not_found_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "404" in message or "not found" in message or "tidak ditemukan" in message
+
+
+def find_best_opensea_collection_slug(payload: Any, query: str) -> str | None:
+    query_slug = normalize_opensea_collection_query(query)
+    if not query_slug:
+        return None
+
+    best_slug = None
+    best_score = -1
+    seen: set[str] = set()
+    for candidate in collect_opensea_collection_slugs(payload):
+        slug = normalize_opensea_collection_query(candidate)
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+
+        base_slug = strip_numeric_slug_suffix(slug)
+        score = 0
+        if slug == query_slug:
+            score = 100
+        elif base_slug == query_slug:
+            score = 95
+        elif slug.startswith(f"{query_slug}-"):
+            score = 85
+        elif query_slug in slug:
+            score = 70
+        elif query_slug.replace("-", "") in slug.replace("-", ""):
+            score = 60
+
+        if score > best_score:
+            best_slug = slug
+            best_score = score
+
+    return best_slug if best_score > 0 else None
+
+
+def collect_opensea_collection_slugs(value: Any) -> list[str]:
+    slugs: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            slugs.extend(collect_opensea_collection_slugs(item))
+        return slugs
+
+    if not isinstance(value, dict):
+        return slugs
+
+    value_type = str(value.get("type") or value.get("asset_type") or "").lower()
+    if value_type and value_type not in {"collection", "collections"}:
+        nested_collection = value.get("collection")
+        if isinstance(nested_collection, (dict, list)):
+            slugs.extend(collect_opensea_collection_slugs(nested_collection))
+        return slugs
+
+    for key, item in value.items():
+        normalized_key = str(key).lower()
+        if normalized_key in {"slug", "collection_slug"} and isinstance(item, str):
+            slugs.append(item)
+            continue
+        if normalized_key == "collection" and isinstance(item, str):
+            slugs.append(item)
+            continue
+        if isinstance(item, (dict, list)):
+            slugs.extend(collect_opensea_collection_slugs(item))
+
+    return slugs
 
 
 def normalize_opensea_chain(chain: str) -> str:
@@ -2675,7 +2911,7 @@ def generic_get_json(
     params: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
 ) -> Any:
-    query = urllib.parse.urlencode(params or {})
+    query = urllib.parse.urlencode(params or {}, doseq=True)
     full_url = f"{url}?{query}" if query else url
     request_headers = {
         "Accept": "application/json",
